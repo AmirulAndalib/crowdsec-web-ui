@@ -95,6 +95,7 @@ CrowdSec Web UI includes Arabic, English, German, French, Hindi, Japanese, Portu
 
 > [!CAUTION]
 > **Security Notice**: This application **does not provide any built-in authentication mechanism**. It is NOT intended to be exposed publicly without protection. We strongly recommend deploying this application behind a reverse proxy with an Identity Provider (IdP) such as [Authentik](https://goauthentik.io/), [Authelia](https://www.authelia.com/), or [Keycloak](https://www.keycloak.org/) to handle authentication and authorization.
+> Set `PERMISSION_READ_ONLY=true` to run an instance that can view data but cannot perform CrowdSec write actions or management actions such as changing refresh cadence, managing notification destinations/rules, sending notification tests, or deleting notifications. Language, table column preferences, and marking notifications as read remain writable. This is an instance-wide safety mode, not user management or per-user RBAC.
 
 ## Architecture
 
@@ -265,6 +266,7 @@ Choose exactly one auth mode: password auth or mTLS auth.
 | `DB_DIR` | `/app/data` | Directory that stores the SQLite database and other persisted app data. If you change it, update your volume mounts too. |
 | `TZ` | browser local | Optional deployment-wide IANA timezone, such as `Europe/Berlin` or `UTC`. When set, the UI, dashboard grouping, filters, and server-generated timestamps all use it. |
 | `CROWDSEC_TIME_FORMAT` | browser locale | Optional deployment-wide clock format. Accepts `12h` or `24h`. When omitted, each browser's locale determines whether the UI uses a 12- or 24-hour clock. |
+| `PERMISSION_READ_ONLY` | `false` | Set to `true` to hide management actions in the UI and reject API requests that add/delete decisions, delete alerts, clean up by IP, clear the cache, change refresh cadence, manage notification destinations/rules, send notification tests, or delete notifications. Language, table column preferences, and marking notifications as read remain writable. |
 | `CROWDSEC_LOOKBACK_PERIOD` | `168h` | Alert/history retention window used for sync and cleanup. Accepts values like `12h`, `7d`, or `30m`. |
 | `CROWDSEC_REFRESH_INTERVAL` | `30s` | Normal background refresh interval. Accepts `0`, `manual`, `5s`, `30s`, `1m`, `5m`, or other `s`/`m`/`h`/`d` values. |
 | `CROWDSEC_IDLE_REFRESH_INTERVAL` | `5m` | Refresh interval used when the app considers itself idle. |
@@ -272,7 +274,7 @@ Choose exactly one auth mode: password auth or mTLS auth.
 | `CROWDSEC_FULL_REFRESH_INTERVAL` | `5m` | Interval for full cache refreshes while active. |
 | `CROWDSEC_LAPI_REQUEST_TIMEOUT` | `30s` | Timeout for individual CrowdSec LAPI requests. Increase this for high-latency or very large CrowdSec datasets. |
 | `CROWDSEC_HEARTBEAT_INTERVAL` | `30s` | Interval for updating the Web UI machine heartbeat in CrowdSec. Use `0` or `manual` to disable heartbeat updates. |
-| `CROWDSEC_ALERT_SYNC_CHUNK` | `6h` | Window size used when syncing historical and active-decision alerts from LAPI. Smaller chunks reduce per-request payload size. |
+| `CROWDSEC_ALERT_SYNC_CHUNK` | `6h` | Window size used when syncing historical alerts from LAPI. Smaller chunks reduce per-request payload size. |
 | `CROWDSEC_ALERT_SYNC_MIN_CHUNK` | `15m` | Smallest window size used when retrying timed-out alert sync windows. |
 | `CROWDSEC_BOOTSTRAP_RETRY_DELAY` | `30s` | Delay between background retries when initial CrowdSec bootstrap fails. |
 | `CROWDSEC_BOOTSTRAP_RETRY_ENABLED` | `true` | Enables background bootstrap retry after startup or login failures. |
@@ -771,7 +773,7 @@ The Web UI maintains its own local history of alerts and decisions. Data fetched
 
 - Alerts are kept for the duration of `CROWDSEC_LOOKBACK_PERIOD` (default: 7 days), then automatically cleaned up.
 - On restart, existing data is reused and new data from LAPI is merged in, then successful full sync windows prune alerts no longer returned by LAPI.
-- Large active-decision sets are synced in `CROWDSEC_ALERT_SYNC_CHUNK` windows. If a window times out, it is retried in smaller windows down to `CROWDSEC_ALERT_SYNC_MIN_CHUNK`.
+- Active-decision refreshes first use one lookback-wide request to avoid excessive LAPI polling. If that request times out, it is retried in smaller windows down to `CROWDSEC_ALERT_SYNC_MIN_CHUNK`.
 - If LAPI is unavailable during startup, the Web UI keeps retrying bootstrap in the background using `CROWDSEC_BOOTSTRAP_RETRY_DELAY` until it can initialize automatically.
 - If some sync windows fail but others succeed, the UI serves the imported cache and marks sync as partial while background retries continue.
 - To force a full cache reset, use the `POST /api/cache/clear` endpoint.
