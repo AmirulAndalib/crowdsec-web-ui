@@ -14,7 +14,7 @@
 
 # CrowdSec Web UI
 
-A modern, responsive web interface for managing [CrowdSec](https://crowdsec.net/) alerts and decisions. Built with **React**, **Vite**, **Node.js**, and **Tailwind CSS**.
+A self-hosted web dashboard for [CrowdSec](https://crowdsec.net/) to review alerts, manage decisions, configure notifications, and optionally view runtime metrics.
 
 <div align="center">
   <a href="https://react.dev/"><img src="https://img.shields.io/badge/react-%2320232a.svg?style=for-the-badge&logo=react&logoColor=%2361DAFB" alt="React" /></a>
@@ -30,7 +30,7 @@ A modern, responsive web interface for managing [CrowdSec](https://crowdsec.net/
 - **Alerts and details**: searchable security-event history with simulation labels, attacker IP, AS, location map, and triggered-event breakdowns.
 - **Decisions**: active/expired ban management, duplicate hiding, simulation filters, and the same unified search used on Alerts.
 - **Manual actions**: add bans directly from the UI with custom duration and reason.
-- **Runtime metrics**: optional Prometheus-backed views for bouncer, machine API, AppSec, parser, parsing-time, and whitelist activity.
+- **Runtime metrics**: optional Prometheus-backed views for bouncer and machine API activity, AppSec, parser flow, LAPI latency, parsing-time, and whitelist activity.
 - **Performance and scale**: backend caching and optimized sync reduce resource pressure and support larger deployments with multiple machines or high alert/decision volumes.
 - **Notifications**: rules for alert spikes, thresholds, new alerts/decisions, IP bans, recent CVEs, LAPI availability, and application updates; delivery to Email, Gotify, MQTT, ntfy, and Webhooks.
 - **Unified search**: free text plus quoted phrases, `field:value`, `AND`, `OR`, `NOT`, unary `-`, parentheses, and page-specific help from the `Info` button.
@@ -73,6 +73,8 @@ A modern, responsive web interface for managing [CrowdSec](https://crowdsec.net/
 - **Cache/database**: SQLite (`better-sqlite3`) stores alerts, decisions, preferences, auth metadata, and notification state under `/app/data`.
 - **CrowdSec integration**: the server authenticates to LAPI as a machine with watcher password auth or agent mTLS, then keeps a local cache updated with delta refreshes and chunked historical sync.
 - **Container security**: the image runs as the non-root `node` user. Authentication can separately protect the browser UI and protected application API routes with password login, passkeys, and OIDC SSO.
+
+See [API.md](API.md) for the application API reference, including auth behavior, route lists, query parameters, and request/response shapes.
 
 ## Prerequisites
 
@@ -249,14 +251,15 @@ Choose exactly one auth mode: password auth or mTLS auth.
 | `CROWDSEC_AUTH_OIDC_CLIENT_SECRET_FILE` | none | Optional Docker Secrets alternative: read `CROWDSEC_AUTH_OIDC_CLIENT_SECRET` from a file. Do not set both variables. |
 | `CROWDSEC_AUTH_OIDC_GROUPS_CLAIM` | `groups` | Optional OIDC claim used for group mapping. The claim may be an array or a comma-separated string. Can also be configured from Settings. |
 | `CROWDSEC_AUTH_OIDC_ADMIN_GROUPS` | empty | Optional comma-separated OIDC groups that receive admin permissions. Can also be configured from Settings. |
-| `CROWDSEC_AUTH_OIDC_READ_ONLY_GROUPS` | empty | Optional comma-separated OIDC groups that receive read-only permissions. If any OIDC group mapping is configured and a user matches no group, the user is read-only. If no OIDC groups are configured, OIDC users default to admin. Can also be configured from Settings. |
+| `CROWDSEC_AUTH_OIDC_READ_ONLY_GROUPS` | empty | Optional comma-separated OIDC groups that receive read-only permissions. Can also be configured from Settings. |
+| `CROWDSEC_AUTH_OIDC_UNMATCHED_ROLE` | `deny` | Controls OIDC users who match no configured admin or read-only group. Accepts `deny`, `admin`, or `read-only`. Can also be configured from Settings. |
 | `CROWDSEC_LOOKBACK_PERIOD` | `168h` | Alert/history retention window used for sync and cleanup. Accepts values like `12h`, `7d`, or `30m`. |
 | `CROWDSEC_REFRESH_INTERVAL` | `30s` | Normal background refresh interval. Accepts `0`, `manual`, `5s`, `30s`, `1m`, `5m`, or other `s`/`m`/`h`/`d` values. |
 | `CROWDSEC_IDLE_REFRESH_INTERVAL` | `5m` | Refresh interval used when the app considers itself idle. |
 | `CROWDSEC_IDLE_THRESHOLD` | `2m` | Inactivity period before the app switches to idle refresh behavior. |
 | `CROWDSEC_FULL_REFRESH_INTERVAL` | `5m` | Interval for full cache refreshes while active. |
 | `CROWDSEC_LAPI_REQUEST_TIMEOUT` | `30s` | Timeout for individual CrowdSec LAPI requests. Increase this for high-latency or very large CrowdSec datasets. |
-| `CROWDSEC_PROMETHEUS_URL` | none | Optional CrowdSec Prometheus metrics endpoint. When unset, the Metrics page shows setup instructions; when set, it reads bouncer, machine, AppSec, parser, and whitelist runtime metrics from this URL. |
+| `CROWDSEC_PROMETHEUS_URL` | none | Optional CrowdSec Prometheus metrics endpoint. When unset, the Metrics page shows setup instructions; when set, it reads bouncer, machine, AppSec, parser, LAPI latency, and whitelist runtime metrics from this URL. |
 | `CROWDSEC_PROMETHEUS_REQUEST_TIMEOUT` | `5s` | Timeout for individual Prometheus metrics requests. Accepts the same interval syntax as refresh settings. |
 | `CROWDSEC_HEARTBEAT_INTERVAL` | `30s` | Interval for updating the Web UI machine heartbeat in CrowdSec. Use `0` or `manual` to disable heartbeat updates. |
 | `CROWDSEC_ALERT_SYNC_CHUNK` | `6h` | Window size used when syncing historical alerts from LAPI. Smaller chunks reduce per-request payload size. |
@@ -299,11 +302,12 @@ CROWDSEC_AUTH_OIDC_CLIENT_SECRET=change-me
 CROWDSEC_AUTH_OIDC_GROUPS_CLAIM=groups
 CROWDSEC_AUTH_OIDC_ADMIN_GROUPS=crowdsec-admins,secops
 CROWDSEC_AUTH_OIDC_READ_ONLY_GROUPS=crowdsec-viewers
+CROWDSEC_AUTH_OIDC_UNMATCHED_ROLE=deny
 ```
 
-OIDC Settings accepts the issuer URL, client ID, client secret, groups claim, admin groups, and read-only groups. Saved Settings values override OIDC environment defaults. Group mapping is optional: leave the group lists empty to treat every OIDC user as an admin. Configure admin/read-only groups only when your Identity Provider should decide which SSO users get write access.
+OIDC Settings accepts the issuer URL, client ID, client secret, groups claim, admin groups, read-only groups, and the unmatched-user policy. Saved Settings values override OIDC environment defaults. By default, OIDC users who match no configured group are denied. Set the unmatched-user policy to `admin` or `read-only` only when every user who can complete OIDC sign-in should receive that fallback role.
 
-OIDC group mapping is lightweight RBAC. `PERMISSION_READ_ONLY=true` is still instance-wide and overrides user roles. For OIDC, admin group matches get full access, read-only group matches can view data and keep allowed preferences, and users with no matching group become read-only whenever any OIDC group mapping is configured.
+OIDC group mapping is lightweight RBAC. `PERMISSION_READ_ONLY=true` is still instance-wide and overrides user roles. For OIDC, admin group matches get full access, read-only group matches can view data and keep allowed preferences, and users with no matching group follow `CROWDSEC_AUTH_OIDC_UNMATCHED_ROLE`.
 
 ### Build and Image Metadata
 
@@ -444,7 +448,9 @@ If you use `BASE_PATH`, the health check still targets `localhost:3000/api/healt
 
 ### Prometheus Metrics Page
 
-The Metrics page shows setup guidance until `CROWDSEC_PROMETHEUS_URL` is set. Once configured, it reads CrowdSec's Prometheus endpoint for bouncer and machine LAPI activity, AppSec requests/blocks, parser and datasource activity, parsing timing, and whitelist hits.
+The Metrics page shows setup guidance until `CROWDSEC_PROMETHEUS_URL` is set. Once configured, it reads CrowdSec's Prometheus endpoint for runtime observability: bouncer and machine LAPI activity, AppSec requests/blocks, parser and datasource activity, LAPI request latency, parsing timing, and whitelist hits.
+
+The page intentionally avoids duplicating alert and decision analytics that are already covered by the main app dashboard and tables. Values come from the current raw Prometheus scrape, so the UI avoids CrowdSec metrics that only become useful with Grafana-style time-window `rate()` or `increase()` queries.
 
 CrowdSec documents the endpoint at `http://127.0.0.1:6060/metrics` by default. To expose the bouncer, machine, AppSec, whitelist, and per-node parser details used by this page, enable Prometheus metrics in CrowdSec with `level: full` in `/etc/crowdsec/config.yaml`:
 
@@ -473,7 +479,7 @@ environment:
   - CROWDSEC_PROMETHEUS_URL=http://crowdsec:6060/metrics
 ```
 
-`level: aggregated` works with less detail because it omits per-machine/per-bouncer LAPI metrics and per-node parser metrics. `level: none` disables metrics registration.
+`level: aggregated` works with less detail because it omits per-machine/per-bouncer LAPI metrics and per-node parser metrics. AppSec and LAPI latency sections also depend on whether the corresponding CrowdSec Prometheus metrics are emitted by your deployment. `level: none` disables metrics registration.
 
 Reference: [CrowdSec Prometheus documentation](https://docs.crowdsec.net/docs/next/observability/prometheus/).
 
