@@ -271,10 +271,10 @@ Choose exactly one auth mode: password auth or mTLS auth.
 | `CROWDSEC_AUTH_OIDC_READ_ONLY_GROUPS` | empty | Optional comma-separated OIDC groups that receive read-only permissions. Can also be configured from Settings. |
 | `CROWDSEC_AUTH_OIDC_UNMATCHED_ROLE` | `deny` | Controls OIDC users who match no configured admin or read-only group. Accepts `deny`, `admin`, or `read-only`. Can also be configured from Settings. |
 | `CROWDSEC_LOOKBACK_PERIOD` | `168h` | Alert/history retention window used for sync and cleanup. Accepts values like `12h`, `7d`, or `30m`. |
-| `CROWDSEC_REFRESH_INTERVAL` | `30s` | Normal background refresh interval. Accepts `0`, `manual`, `5s`, `30s`, `1m`, `5m`, or other `s`/`m`/`h`/`d` values. |
-| `CROWDSEC_IDLE_REFRESH_INTERVAL` | `5m` | Refresh interval used when the app considers itself idle. |
+| `CROWDSEC_REFRESH_INTERVAL` | `1m` | Normal background refresh interval. Accepts `0`, `manual`, `5s`, `30s`, `1m`, `5m`, or other `s`/`m`/`h`/`d` values. |
+| `CROWDSEC_IDLE_REFRESH_INTERVAL` | `10m` | Refresh interval used when the app considers itself idle. |
 | `CROWDSEC_IDLE_THRESHOLD` | `2m` | Inactivity period before the app switches to idle refresh behavior. |
-| `CROWDSEC_FULL_REFRESH_INTERVAL` | `5m` | Interval for full cache refreshes while active. |
+| `CROWDSEC_FULL_REFRESH_INTERVAL` | `3h` | Interval for full cache refreshes while active. |
 | `CROWDSEC_LAPI_REQUEST_TIMEOUT` | `30s` | Timeout for individual CrowdSec LAPI requests. Increase this for high-latency or very large CrowdSec datasets. |
 | `CROWDSEC_PROMETHEUS_URL` | none | Optional CrowdSec Prometheus metrics endpoint. When unset, the Metrics page shows setup instructions; when set, it reads bouncer, machine, AppSec, parser, LAPI latency, and whitelist runtime metrics from this URL. |
 | `CROWDSEC_PROMETHEUS_REQUEST_TIMEOUT` | `5s` | Timeout for individual Prometheus metrics requests. Accepts the same interval syntax as refresh settings. |
@@ -298,6 +298,9 @@ Choose exactly one auth mode: password auth or mTLS auth.
 ### File-Backed Secrets
 
 `CROWDSEC_PASSWORD_FILE`, `NOTIFICATION_SECRET_KEY_FILE`, `CROWDSEC_AUTH_SECRET_FILE`, and `CROWDSEC_AUTH_OIDC_CLIENT_SECRET_FILE` read their values from UTF-8 files, including Docker Secrets mounts under `/run/secrets`. For each setting, configure the direct variable or its `_FILE` alternative, not both. The app fails fast when both are set or when a configured file cannot be read. File-backed secrets are loaded during startup, so restart the app after rotating a mounted secret.
+
+> [!IMPORTANT]
+> The auto-generated `CROWDSEC_AUTH_SECRET` and `NOTIFICATION_SECRET_KEY` are stored in the same SQLite database as the values they protect. This is convenient and preserves existing installations, but it does not protect secrets or session signing from someone who obtains a complete database or backup. Deployments whose threat model includes database-copy disclosure should provide both keys through their `_FILE` variables, restrict access to the mounted secret files and backups, and rotate the keys after suspected exposure.
 
 ### Authentication
 
@@ -326,6 +329,8 @@ CROWDSEC_AUTH_OIDC_UNMATCHED_ROLE=deny
 OIDC Settings accepts the issuer URL, client ID, client secret, authorization scopes, groups claim, admin groups, read-only groups, and the unmatched-user policy. Saved Settings values override OIDC environment defaults. Authorization scopes must include `openid`; add provider-specific scopes such as `groups` only when your IdP requires them for the configured groups claim. By default, OIDC users who match no configured group are denied. Set the unmatched-user policy to `admin` or `read-only` only when every user who can complete OIDC sign-in should receive that fallback role.
 
 OIDC group mapping is lightweight RBAC. `PERMISSION_READ_ONLY=true` is still instance-wide and overrides user roles. For OIDC, admin group matches get full access, read-only group matches can view data and keep allowed preferences, and users with no matching group follow `CROWDSEC_AUTH_OIDC_UNMATCHED_ROLE`.
+
+OIDC identities are bound to the provider's stable issuer and subject claims. Existing OIDC rows are migrated in place on their next successful SSO login; if an OIDC username conflicts with a local account, the accounts remain separate. OIDC sessions have a 24-hour absolute lifetime and are not silently extended from stale role claims. OIDC-only accounts cannot register or use local passkeys, so removing access at the IdP cannot be bypassed by creating a permanent local credential. Password-backed local accounts keep their existing passkey support.
 
 ### Build and Image Metadata
 
@@ -442,6 +447,8 @@ location /crowdsec/ {
 ```
 
 `BASE_PATH` must start with `/` and must not include a trailing slash. When set, `/` redirects to the base path and all API calls, assets, and navigation use it automatically.
+
+The backend applies a Content Security Policy, rejects browser mutation requests whose `Origin` does not match the public request origin, limits API request bodies to 1 MiB, and marks API responses as `private, no-store`. Command-line and service clients that omit browser `Origin` and `Sec-Fetch-Site` headers remain compatible. Configure HSTS at the TLS-terminating reverse proxy if desired; the application does not emit HSTS itself.
 
 ### Health Check
 
@@ -639,7 +646,7 @@ volumes:
 
 ### How It Works
 
-The Web UI maintains local alert and decision history. Data from CrowdSec LAPI is preserved across restarts, merged with new data on boot, and reconciled during successful full refreshes so alerts deleted outside the UI are removed locally too. Alerts are indexed by CrowdSec `start_at` when present, falling back to `created_at`, so replayed alerts are shown at the original alert/event time rather than the replay import time. Alerts are kept for `CROWDSEC_LOOKBACK_PERIOD` (default: 7 days), then cleaned up automatically.
+The Web UI maintains local alert and decision history. Data from CrowdSec LAPI is preserved across restarts, merged with new data on boot, and reconciled during successful full refreshes so alerts deleted outside the UI are removed locally too. Alerts and decisions keep the full raw CrowdSec payload for details and compatibility, while SQLite stores indexed derived fields for list filtering, search, pagination, and dashboard statistics. Alerts are indexed by CrowdSec `start_at` when present, falling back to `created_at`, so replayed alerts are shown at the original alert/event time rather than the replay import time. Alerts are kept for `CROWDSEC_LOOKBACK_PERIOD` (default: 7 days), then cleaned up automatically.
 
 Active-decision refreshes use the same `CROWDSEC_ALERT_SYNC_CHUNK` windows as historical alert sync so large active-decision sets are processed incrementally. If a window times out, it is retried in smaller windows down to `CROWDSEC_ALERT_SYNC_MIN_CHUNK`. If LAPI is unavailable during startup, bootstrap retries continue in the background using `CROWDSEC_BOOTSTRAP_RETRY_DELAY`; if only some sync windows fail, the UI serves the imported cache and marks sync partial while retries continue. To force a full cache reset, use `POST /api/cache/clear`.
 
@@ -661,7 +668,7 @@ Active-decision refreshes use the same `CROWDSEC_ALERT_SYNC_CHUNK` windows as hi
    CROWDSEC_PASSWORD=<your-secure-password>
    CROWDSEC_PROMETHEUS_URL=http://localhost:6060/metrics
    CROWDSEC_SIMULATIONS_ENABLED=true
-   CROWDSEC_REFRESH_INTERVAL=30s
+   CROWDSEC_REFRESH_INTERVAL=1m
    CROWDSEC_LAPI_REQUEST_TIMEOUT=30s
    CROWDSEC_ALERT_SYNC_CHUNK=12h
    CROWDSEC_ALERT_SYNC_MIN_CHUNK=15m
@@ -679,7 +686,7 @@ Active-decision refreshes use the same `CROWDSEC_ALERT_SYNC_CHUNK` windows as hi
    # Optional when using a private CA or self-signed CrowdSec LAPI certificate
    CROWDSEC_TLS_CA_CERT_PATH=/path/to/ca.pem
    CROWDSEC_SIMULATIONS_ENABLED=true
-   CROWDSEC_REFRESH_INTERVAL=30s
+   CROWDSEC_REFRESH_INTERVAL=1m
    ```
 
 3. **Start or build**
@@ -699,7 +706,45 @@ Active-decision refreshes use the same `CROWDSEC_ALERT_SYNC_CHUNK` windows as hi
    ./run.sh
    ```
 
-4. **CrowdSec mTLS smoke test**
+4. **Manual large-dataset UI load test**
+
+   To test the UI against a repeatable synthetic cache without using a large production CrowdSec instance, start load-test mode:
+   ```bash
+   ./run.sh loadtest
+   ```
+
+   Load-test mode seeds a repeatable fake-LAPI source dataset in a separate SQLite database, builds the frontend, and starts a local backend with authentication disabled. On startup, the backend imports that source dataset through the normal bootstrap/full-sync path before serving it from the app cache. The UI opens on the default Dashboard at `http://localhost:3000/`. The default source dataset is `300000` alerts and `300000` embedded decisions under `/tmp/crowdsec-web-ui-load-test`. Load-test mode prints source seed timings, sync progress, `/api` requests, and event-loop stalls of at least 100ms to the console while it runs.
+
+   Override the dataset with environment variables:
+   ```bash
+   LOADTEST_ALERTS=1000 LOADTEST_DECISIONS=1000 ./run.sh loadtest
+   ```
+
+   Supported load-test variables:
+   ```bash
+   LOADTEST_ALERTS=300000
+   LOADTEST_DECISIONS=300000
+   LOADTEST_SEED=1337
+   LOADTEST_DB_DIR=/tmp/crowdsec-web-ui-load-test
+   LOADTEST_BACKEND_PORT=3000
+   LOADTEST_ACTIVE_DECISION_RATIO=0.7
+   LOADTEST_SIMULATION_RATIO=0.1
+   LOADTEST_DUPLICATE_VALUE_RATIO=0.15
+   LOADTEST_REFRESH_ALERTS=100
+   LOADTEST_REFRESH_DECISIONS=100
+   CROWDSEC_REFRESH_INTERVAL=1m
+   CROWDSEC_FULL_REFRESH_INTERVAL=3h
+   CROWDSEC_IDLE_REFRESH_INTERVAL=10m
+   CROWDSEC_IDLE_THRESHOLD=2m
+   CROWDSEC_LOOKBACK_PERIOD=30d
+   CROWDSEC_ALERT_SYNC_CHUNK=12h
+   CROWDSEC_ALERT_SYNC_MIN_CHUNK=15m
+   CROWDSEC_SIMULATIONS_ENABLED=true
+   ```
+
+   Both the initial source dataset and later refresh batches are exposed through the fake LAPI. On each due refresh batch it exposes `LOADTEST_REFRESH_ALERTS` new synthetic alerts and `LOADTEST_REFRESH_DECISIONS` new synthetic decisions, then the regular sync code imports them into SQLite.
+
+5. **CrowdSec mTLS smoke test**
 
    Starts a disposable CrowdSec LAPI container, generates temporary server/client certificates, enables LAPI client certificate verification, logs in through the Web UI LAPI client, and confirms CrowdSec registered the TLS machine.
    ```bash

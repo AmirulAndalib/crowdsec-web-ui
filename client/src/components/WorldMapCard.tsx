@@ -14,6 +14,7 @@ import type { WorldMapDatum } from '../types';
 import { DASHBOARD_COLORS } from '../lib/dashboardColors';
 import { useI18n } from '../lib/i18n';
 import { getCountryName } from '../lib/utils';
+import { CountryFlag } from './CountryFlag';
 
 // Using local Natural Earth data which has proper ISO properties
 const geoUrl = assetUrl("/world-50m.json");
@@ -52,6 +53,63 @@ interface WorldMapCardProps {
     onCountrySelect: (countryCode: string) => void;
     selectedCountry: string | null;
     simulationsEnabled?: boolean;
+}
+
+let geoFeaturesPromise: Promise<GeoFeature[]> | null = null;
+
+function loadGeoFeatures(): Promise<GeoFeature[]> {
+    if (geoFeaturesPromise) {
+        return geoFeaturesPromise;
+    }
+
+    geoFeaturesPromise = fetch(geoUrl)
+        .then((response) => {
+            if (!response.ok) {
+                throw new Error(`Failed to load map data: ${response.status}`);
+            }
+            return response.json() as Promise<GeoJsonResponse>;
+        })
+        .then((payload) => {
+            const seenCodes = new Set<string>();
+            return (payload.features || [])
+                .filter((feature) => feature.properties?.ISO_A2 !== 'AQ' && feature.properties?.NAME !== 'Antarctica')
+                .map(feature => {
+                    const properties = feature.properties || {};
+                    const candidates = [
+                        properties.ISO_A2,
+                        properties.iso_a2,
+                        properties.ISO_A2_EH,
+                        properties.WB_A2
+                    ];
+
+                    let validCode: string | null = null;
+                    for (const code of candidates) {
+                        if (code && code !== '-99' && /^[A-Z]{2}$/i.test(String(code))) {
+                            validCode = String(code).toUpperCase();
+                            break;
+                        }
+                    }
+
+                    return {
+                        ...feature,
+                        id: validCode || feature.id || properties.NAME
+                    };
+                })
+                .filter((feature): feature is GeoFeature => typeof feature.id === 'string' && feature.id.length > 0)
+                .filter((feature) => {
+                    if (seenCodes.has(feature.id)) {
+                        return false;
+                    }
+                    seenCodes.add(feature.id);
+                    return true;
+                });
+        })
+        .catch((error) => {
+            geoFeaturesPromise = null;
+            throw error;
+        });
+
+    return geoFeaturesPromise;
 }
 
 function getFeatureCountryCode(feature: ChoroplethBoundFeature): string {
@@ -159,8 +217,11 @@ export function WorldMapCard({ data, onCountrySelect, selectedCountry, simulatio
                 data-testid="world-map-tooltip"
                 className="fixed z-[99999] pointer-events-none bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border border-gray-200 dark:border-gray-700 shadow-xl rounded-lg p-3 text-sm max-w-[200px]"
             >
-                <div className={`font-medium ${showMetricRows ? 'mb-2' : ''}`}>
-                    {getCountryName(featureId, language) ?? feature.label ?? featureId}
+                <div className={`flex items-center gap-2 font-medium ${showMetricRows ? 'mb-2' : ''}`}>
+                    <CountryFlag code={featureId} />
+                    <span className="min-w-0">
+                        {getCountryName(featureId, language) ?? feature.label ?? featureId}
+                    </span>
                 </div>
                 {showMetricRows && (
                     <>
@@ -293,55 +354,25 @@ export function WorldMapCard({ data, onCountrySelect, selectedCountry, simulatio
         };
     }, [dimensions.width, dimensions.height]);
 
-    // Fetch and process map data
+    // Fetch and process map data once, including across development StrictMode remounts.
     useEffect(() => {
-        fetch(geoUrl)
-            .then((response) => response.json() as Promise<GeoJsonResponse>)
-            .then((payload) => {
-                if (payload.features) {
-                    const seenCodes = new Set<string>();
-                    const processedFeatures = payload.features
-                        .filter((feature) => feature.properties?.ISO_A2 !== 'AQ' && feature.properties?.NAME !== 'Antarctica')
-                        .map(feature => {
-                            const properties = feature.properties || {};
-                            // POSTAL removed - it can conflict with ISO codes
-                            // (e.g., N. Cyprus has POSTAL=CN which would hide China)
-                            const candidates = [
-                                properties.ISO_A2,
-                                properties.iso_a2,
-                                properties.ISO_A2_EH,
-                                properties.WB_A2
-                            ];
+        let active = true;
 
-                            let validCode: string | null = null;
-                            for (const code of candidates) {
-                                if (code && code !== '-99' && /^[A-Z]{2}$/i.test(String(code))) {
-                                    validCode = String(code).toUpperCase();
-                                    break;
-                                }
-                            }
-
-                            return {
-                                ...feature,
-                                id: validCode || feature.id || properties.NAME
-                            };
-                        })
-                        .filter((feature): feature is GeoFeature => typeof feature.id === 'string' && feature.id.length > 0)
-                        .filter((feature) => {
-                            if (seenCodes.has(feature.id)) {
-                                return false;
-                            }
-                            seenCodes.add(feature.id);
-                            return true;
-                        });
-                    setGeoFeatures(processedFeatures);
-                }
+        loadGeoFeatures()
+            .then((features) => {
+                if (!active) return;
+                setGeoFeatures(features);
                 setIsLoadingStats(false);
             })
             .catch((err: unknown) => {
+                if (!active) return;
                 console.error("Failed to load map data", err);
                 setIsLoadingStats(false);
             });
+
+        return () => {
+            active = false;
+        };
     }, []);
 
     // Build nivoData

@@ -8,6 +8,7 @@ import { Modal } from "../components/ui/Modal";
 import { HighlightedSearchInput } from "../components/HighlightedSearchInput";
 import { SearchSyntaxModal } from "../components/SearchSyntaxModal";
 import { TableColumnsModal } from "../components/TableColumnsModal";
+import { CountryFlag } from "../components/CountryFlag";
 import { ScenarioName } from "../components/ScenarioName";
 import { TimeDisplay } from "../components/TimeDisplay";
 import { EventCard } from "../components/EventCard";
@@ -18,7 +19,7 @@ import { TABLE_COLUMN_DEFINITIONS } from "../../../shared/contracts";
 import { resolveMachineName } from "../../../shared/machine";
 import { collectDistinctOrigins, getOriginDisplayValue, getOriginTitle } from "../../../shared/origin";
 import { compileAlertSearch, getSearchHelpDefinition, type SearchParseError } from "../../../shared/search";
-import { Info, ExternalLink, Shield, ShieldBan, Trash2, X, AlertCircle, Columns3 } from "lucide-react";
+import { Info, ExternalLink, Shield, ShieldBan, Trash2, X, AlertCircle, Columns3, Loader2 } from "lucide-react";
 import type { AlertRecord, AlertSource, ApiPermissionError, BulkDeleteResult, DecisionListItem, SimulationFilter, SlimAlert, TableColumnId, TableColumnPreferences } from '../types';
 import { useI18n, type I18nContextValue } from "../lib/i18n";
 import { getBrowserTimeZone, useDateTime } from "../lib/dateTime";
@@ -70,6 +71,19 @@ function ErrorBanner({ errorInfo, onDismiss }: { errorInfo: ErrorInfo; onDismiss
                 </button>
             )}
         </div>
+    );
+}
+
+function TableLoadingRow({ colSpan, label }: { colSpan: number; label: string }) {
+    return (
+        <tr>
+            <td colSpan={colSpan} className="bg-primary-50/60 dark:bg-primary-900/10 px-6 py-4 text-center">
+                <span className="inline-flex items-center justify-center gap-2 text-sm font-medium text-primary-700 dark:text-primary-300" aria-live="polite">
+                    <Loader2 size={16} className="animate-spin" aria-hidden="true" />
+                    {label}
+                </span>
+            </td>
+        </tr>
     );
 }
 
@@ -354,9 +368,13 @@ export function Alerts() {
             setTotalPages(alertsResult.pagination.total_pages);
             setTotalAlerts(alertsResult.pagination.total);
             setTotalUnfilteredAlerts(alertsResult.pagination.unfiltered_total);
-            const nextSelectableIds = alertsResult.selectable_ids.map(String);
-            setSelectableAlertIds(nextSelectableIds);
-            setSelectedAlertIds((current) => current.filter((id) => nextSelectableIds.includes(id)));
+            const nextSelectableIds = alertsData.map((alert) => String(alert.id));
+            setSelectableAlertIds((current) => append
+                ? Array.from(new Set([...current, ...nextSelectableIds]))
+                : nextSelectableIds);
+            if (!append) {
+                setSelectedAlertIds((current) => current.filter((id) => nextSelectableIds.includes(id)));
+            }
             hasLoadedAlertsRef.current = true;
             setHasLoadedAlerts(true);
 
@@ -1073,7 +1091,7 @@ export function Alerts() {
                                                             <td key={columnId} className="px-6 py-4 text-sm text-gray-900 dark:text-gray-100 align-middle">
                                                                 {alert.source?.cn && alert.source?.cn !== "Unknown" ? (
                                                                     <div className="flex items-center gap-2" title={alert.source.cn}>
-                                                                        <span className={`fi fi-${alert.source.cn.toLowerCase()} flex-shrink-0`}></span>
+                                                                        <CountryFlag code={alert.source.cn} />
                                                                         <span className="truncate max-w-[150px]">{getCountryName(alert.source.cn, language)}</span>
                                                                     </div>
                                                                 ) : (
@@ -1189,6 +1207,9 @@ export function Alerts() {
                                     );
                                 })
                             )}
+                            {loadingMore && visibleAlerts.length > 0 && (
+                                <TableLoadingRow colSpan={alertTableColSpan} label={t('pages.alerts.loadingMore')} />
+                            )}
                         </tbody>
                     </table>
                 </div>
@@ -1238,7 +1259,7 @@ export function Alerts() {
                                 <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">{t('pages.alerts.location')}</h4>
                                 <div className="text-lg text-gray-900 dark:text-gray-100 font-medium flex items-center gap-2">
                                     {selectedAlert.source?.cn && (
-                                        <span className={`fi fi-${selectedAlert.source.cn.toLowerCase()} flex-shrink-0`} title={selectedAlert.source.cn}></span>
+                                        <CountryFlag code={selectedAlert.source.cn} />
                                     )}
                                     {getCountryName(selectedAlert.source?.cn, language) || "-"}
                                 </div>
@@ -1396,11 +1417,7 @@ export function Alerts() {
                                                 );
                                             })}
                                             {modalDecisionsLoadingMore && (
-                                                <tr>
-                                                    <td colSpan={6} className="px-4 py-4 text-sm text-center text-gray-500">
-                                                        {t('pages.decisions.loadingMore')}
-                                                    </td>
-                                                </tr>
+                                                <TableLoadingRow colSpan={6} label={t('pages.decisions.loadingMore')} />
                                             )}
                                         </tbody>
                                     </table>

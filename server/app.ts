@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'node:crypto';
 import { Hono } from 'hono';
 import { compress } from 'hono/compress';
+import { bodyLimit } from 'hono/body-limit';
 import { serveStatic } from '@hono/node-server/serve-static';
 import type {
   AddDecisionRequest,
@@ -35,7 +36,7 @@ import type {
 } from '../shared/contracts';
 import { resolveMachineName } from '../shared/machine';
 import { collectDistinctOrigins, normalizeOrigin } from '../shared/origin';
-import { compileAlertSearch, compileDecisionSearch, matchesIpSearchValue, type SearchParseError } from '../shared/search';
+import { compileAlertSearch, compileDecisionSearch, matchesIpSearchValue, type SearchNode, type SearchParseError } from '../shared/search';
 import { createRuntimeConfig, getIntervalName, parseRefreshInterval, type RuntimeConfig } from './config';
 import { getDateTimeKey, getTimeZoneOffsetMs, getZonedHourlyBucketKeys } from './utils/date-time';
 import { CrowdsecDatabase, type AlertInsertParams, type DecisionInsertParams } from './database';
@@ -50,6 +51,8 @@ import { getServerTranslator, normalizeLanguagePreference, saveLanguagePreferenc
 import { getAlertSourceValue, getAlertTarget, resolveAlertHistoryAt, resolveAlertReason, resolveAlertScenario, toSlimAlert } from './utils/alerts';
 import { parseGoDuration, toDuration } from './utils/duration';
 import { fetchCrowdsecMetrics } from './metrics';
+import { DatabaseQueryWorker, QueryWorkerTimeoutError } from './query-worker-client';
+import { DatabaseSyncWorker, type SyncAlertMutation } from './sync-worker-client';
 
 type HonoContext = any;
 type HonoNext = any;
@@ -72,6 +75,22 @@ export interface CreateAppOptions {
   notificationFetchImpl?: FetchLike;
   metricsFetchImpl?: FetchLike;
   mqttPublishImpl?: (config: MqttPublishConfig, payload: string) => Promise<void>;
+  initialCacheState?: Partial<CacheState>;
+  rootRedirectPath?: string;
+  queryWorker?: DatabaseQueryWorker;
+  syncWorker?: Pick<
+    DatabaseSyncWorker,
+    | 'persistAlerts'
+    | 'deleteAlertsMissingBetween'
+    | 'deleteCachedAlerts'
+    | 'deleteCachedDecisions'
+    | 'beginDeferredSearchIndexUpdates'
+    | 'rebuildSearchIndexes'
+    | 'refreshDecisionDuplicateFlags'
+    | 'cleanupOldData'
+    | 'clearSyncData'
+    | 'close'
+  >;
 }
 
 export interface AppController {
@@ -125,6 +144,7 @@ interface SyncHistorySummary {
   state: 'complete' | 'partial' | 'failed';
   cachedAlerts: number;
   cachedDecisions: number;
+  changed: boolean;
 }
 
 interface WindowSyncSummary {
@@ -132,12 +152,14 @@ interface WindowSyncSummary {
   decisions: number;
   errors: string[];
   successfulWindows: number;
+  changed: boolean;
 }
 
 interface ActiveWindowSyncSummary {
   decisionCountsByAlertId: Map<string, number>;
   errors: string[];
   successfulWindows: number;
+  changed: boolean;
 }
 
 interface CachedDecisionRecord {
@@ -257,7 +279,14 @@ interface DashboardDecisionAccumulator {
   activeSimulatedDecisionBuckets: Map<string, number>;
 }
 const NOTIFICATION_SECRET_KEY_META_KEY = 'notification_secret_key';
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const API_BODY_LIMIT_BYTES = 1024 * 1024;
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const DASHBOARD_LOOP_YIELD_INTERVAL = 5_000;
+const DASHBOARD_INDEX_BATCH_SIZE = 5_000;
+const DASHBOARD_COLD_BUILD_ROW_LIMIT = 100_000;
+// Writes run in the maintenance worker; this size balances worker-message overhead
+// against short WAL write transactions that let read workers keep snapshots moving.
+const SYNC_WRITE_BATCH_SIZE = 1_000;
 const LEGACY_UNFILTERED_ALERT_ORIGIN_TOKENS = new Set(['none']);
 const CAPI_ALERT_ORIGIN = 'CAPI';
 const LISTS_ALERT_ORIGIN = 'lists';
@@ -291,6 +320,31 @@ function countAlertDecisions(alerts: AlertRecord[]): number {
 
 function formatSignedCount(count: number): string {
   return count > 0 ? `+${count}` : String(count);
+}
+
+function formatElapsedTime(ms: number): string {
+  if (ms < 1_000) return `${ms}ms`;
+  return `${(ms / 1_000).toFixed(2)}s`;
+}
+
+function getPublicRequestOrigin(context: HonoContext): string {
+  const forwardedHost = context.req.header('x-forwarded-host')?.split(',')[0]?.trim();
+  const host = forwardedHost || context.req.header('host');
+  const forwardedProto = context.req.header('x-forwarded-proto')?.split(',')[0]?.trim();
+  const url = new URL(context.req.url);
+  const protocol = forwardedProto || url.protocol.replace(/:$/, '');
+  return host ? `${protocol}://${host}` : url.origin;
+}
+
+function isRequestOriginAllowed(context: HonoContext): boolean {
+  if (context.req.header('sec-fetch-site') === 'cross-site') return false;
+  const origin = context.req.header('origin');
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === new URL(getPublicRequestOrigin(context)).origin;
+  } catch {
+    return false;
+  }
 }
 
 function readUpdateCheckOverrides(query: Record<string, string | string[]>): UpdateCheckOverrides {
@@ -331,8 +385,11 @@ export function createApp(options: CreateAppOptions = {}): AppController {
   const notificationOutboundGuard = createNotificationOutboundGuard({
     allowPrivateAddresses: config.notificationAllowPrivateAddresses,
   });
+  const queryWorker = options.queryWorker || new DatabaseQueryWorker({ dbPath: database.dbPath });
+  const syncWorker = options.syncWorker || new DatabaseSyncWorker({ dbPath: database.dbPath });
   const notificationService = createNotificationService({
     database,
+    queryWorker,
     fetchImpl: options.notificationFetchImpl,
     mqttPublishImpl: options.mqttPublishImpl,
     updateChecker: checkForUpdates,
@@ -354,6 +411,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
   const distRoot = options.distRoot || path.resolve(process.cwd(), 'dist/client');
   const staticFiles = [
     '/logo.svg',
+    '/logo-sidebar.png',
     '/favicon.ico',
     '/robots.txt',
     '/world-50m.json',
@@ -374,11 +432,16 @@ export function createApp(options: CreateAppOptions = {}): AppController {
   };
 
   const cache: CacheState = {
-    isInitialized: false,
-    isComplete: false,
-    lastUpdate: null,
+    isInitialized: options.initialCacheState?.isInitialized ?? false,
+    isComplete: options.initialCacheState?.isComplete ?? false,
+    lastUpdate: options.initialCacheState?.lastUpdate ?? null,
   };
   let dashboardStatsCache: DashboardStatsCache | null = null;
+  let dashboardStatsCacheVersion = 0;
+  const dashboardStatsResponseCache = new Map<string, DashboardStatsResponse>();
+  const staleDashboardStatsResponseCache = new Map<string, DashboardStatsResponse>();
+  const dashboardStatsIndexPromises = new Map<string, Promise<DashboardStatsCache>>();
+  const dashboardStatsResponsePromises = new Map<string, Promise<DashboardStatsResponse>>();
 
   const persistedConfig = loadPersistedConfig(database);
   let refreshIntervalMs = persistedConfig.refresh_interval_ms ?? config.refreshIntervalMs;
@@ -394,6 +457,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
   let heartbeatFailureLogged = false;
   let bootstrapRetryTimeout: ReturnType<typeof setTimeout> | null = null;
   let bootstrapPromise: Promise<boolean> | null = null;
+  let bootstrapSource: string | null = null;
   let bootstrapWaitLogged = false;
 
   console.log(`Cache Configuration:
@@ -430,11 +494,35 @@ export function createApp(options: CreateAppOptions = {}): AppController {
 
   app.use('*', compress());
   app.use('*', async (context, next) => {
+    const cspNonce = crypto.randomBytes(16).toString('base64');
+    (context as HonoContext).set('cspNonce', cspNonce);
     await next();
     context.header('X-Content-Type-Options', 'nosniff');
     context.header('X-Frame-Options', 'DENY');
     context.header('Referrer-Policy', 'strict-origin-when-cross-origin');
     context.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    context.header(
+      'Content-Security-Policy',
+      `default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self' 'nonce-${cspNonce}'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:`,
+    );
+    const pathname = new URL(context.req.url).pathname;
+    const apiPrefix = `${config.basePath}/api/`;
+    if (pathname.startsWith(apiPrefix) || pathname === `${config.basePath}/api`) {
+      context.header('Cache-Control', 'private, no-store');
+      context.header('Pragma', 'no-cache');
+      context.header('Expires', '0');
+    }
+  });
+
+  app.use(`${config.basePath}/api/*`, bodyLimit({
+    maxSize: API_BODY_LIMIT_BYTES,
+    onError: (context) => context.json({ error: 'Request body is too large' }, 413),
+  }));
+  app.use(`${config.basePath}/api/*`, async (context, next) => {
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(context.req.method) && !isRequestOriginAllowed(context)) {
+      return context.json({ error: 'Cross-origin request rejected' }, 403);
+    }
+    await next();
   });
 
   app.use('*', activityTrackerMiddleware);
@@ -462,16 +550,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         await updateCache();
       }
 
-      if (!cache.isInitialized) {
-        await ensureBootstrapReady('alerts request');
-      }
-
-      const since = new Date(Date.now() - config.lookbackMs).toISOString();
-      const alerts = hydrateAlertsBatch(database.getAlertsSince(since))
-        .map((alert) => applySimulationModeToAlert(alert, config.simulationsEnabled))
-        .filter((alert): alert is AlertRecord => alert !== null)
-        .map((alert) => toSlimAlert(alert))
-        .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
+      await prepareReadCache('alerts request');
 
       const pageRequest = getPageRequest(context);
       if (pageRequest) {
@@ -486,20 +565,22 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         if (!compiledSearch.ok) {
           return context.json(toSearchErrorResponse(compiledSearch.error), 400);
         }
-        const filteredAlerts = alerts.filter((alert) =>
-          matchesAlertListFilters(alert, filters) &&
-          compiledSearch.predicate(alert),
-        );
-        return context.json(toPaginatedResponse(
-          filteredAlerts,
-          pageRequest,
-          alerts.length,
-          filteredAlerts.map((alert) => alert.id),
-        ));
+        return context.json(await queryPaginatedAlerts(pageRequest, filters, compiledSearch.ast));
       }
+
+      const since = new Date(Date.now() - config.lookbackMs).toISOString();
+      const alerts = hydrateAlertsBatch(database.getAlertsSince(since))
+        .map((alert) => applySimulationModeToAlert(alert, config.simulationsEnabled))
+        .filter((alert): alert is AlertRecord => alert !== null)
+        .map((alert) => toSlimAlert(alert))
+        .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
 
       return context.json(alerts);
     } catch (error: any) {
+      if (error instanceof QueryWorkerTimeoutError) {
+        console.warn('Timed out serving alerts from database:', error.message);
+        return context.json({ error: 'Alert query timed out' }, 504);
+      }
       console.error('Error serving alerts from database:', error.message);
       return context.json({ error: 'Failed to retrieve alerts' }, 500);
     }
@@ -519,7 +600,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         return context.json({ error: 'Alert IDs must be numeric' }, 400);
       }
 
-      const result = await deleteAlertsByIds(ids);
+      const result = await deleteAlertsByIdsInChunks(ids);
       if (result.deleted_decisions > 0) {
         void runNotificationEvaluation('bulk alert delete');
       }
@@ -573,7 +654,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       const result = await deleteAlertFromLapi(alertId);
       database.deleteAlert(alertId);
       database.deleteDecisionsByAlertId(alertId);
-      dashboardStatsCache = null;
+      invalidateDashboardStatsCache();
       return context.json((result as object) || { message: 'Deleted' });
     };
 
@@ -590,11 +671,25 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         await updateCache();
       }
 
-      if (!cache.isInitialized) {
-        await ensureBootstrapReady('decisions request');
+      await prepareReadCache('decisions request');
+
+      const pageRequest = getPageRequest(context);
+      const includeExpired = context.req.query('include_expired') === 'true';
+      if (pageRequest) {
+        const filters = getDecisionListFilters(context, config.timeZone);
+        const compiledSearch = compileDecisionSearch(filters.q, {
+          machineEnabled: true,
+          originEnabled: true,
+        }, {
+          timezoneOffsetMinutes: filters.timezoneOffsetMinutes,
+          timeZone: filters.timeZone,
+        });
+        if (!compiledSearch.ok) {
+          return context.json(toSearchErrorResponse(compiledSearch.error), 400);
+        }
+        return context.json(await queryPaginatedDecisions(pageRequest, filters, compiledSearch.ast, includeExpired));
       }
 
-      const includeExpired = context.req.query('include_expired') === 'true';
       const now = new Date().toISOString();
       const since = new Date(Date.now() - config.lookbackMs).toISOString();
       const rows = includeExpired
@@ -614,35 +709,12 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       decisions = markDuplicateDecisions(decisions);
       decisions.sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
 
-      const pageRequest = getPageRequest(context);
-      if (pageRequest) {
-        const filters = getDecisionListFilters(context, config.timeZone);
-        const compiledSearch = compileDecisionSearch(filters.q, {
-          machineEnabled: true,
-          originEnabled: true,
-        }, {
-          timezoneOffsetMinutes: filters.timezoneOffsetMinutes,
-          timeZone: filters.timeZone,
-        });
-        if (!compiledSearch.ok) {
-          return context.json(toSearchErrorResponse(compiledSearch.error), 400);
-        }
-        const filteredDecisions = decisions.filter((decision) =>
-          matchesDecisionListFilters(decision, filters) &&
-          compiledSearch.predicate(decision),
-        );
-        return context.json(toPaginatedResponse(
-          filteredDecisions,
-          pageRequest,
-          decisions.length,
-          filteredDecisions
-            .filter((decision) => !isDecisionListItemExpired(decision))
-            .map((decision) => decision.id),
-        ));
-      }
-
       return context.json(decisions);
     } catch (error: any) {
+      if (error instanceof QueryWorkerTimeoutError) {
+        console.warn('Timed out serving decisions from database:', error.message);
+        return context.json({ error: 'Decision query timed out' }, 504);
+      }
       console.error('Error serving decisions from database:', error.message);
       return context.json({ error: 'Failed to retrieve decisions' }, 500);
     }
@@ -940,10 +1012,11 @@ export function createApp(options: CreateAppOptions = {}): AppController {
 
     try {
       console.log('Manual cache clear requested');
-      database.clearSyncData();
+      await syncWorker.clearSyncData();
       cache.isInitialized = false;
       cache.lastUpdate = null;
-      dashboardStatsCache = null;
+      staleDashboardStatsResponseCache.clear();
+      invalidateDashboardStatsCache();
       isFirstSync = true;
       await ensureBootstrapReady('manual cache clear');
 
@@ -964,44 +1037,48 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         await updateCache();
       }
 
-      if (!cache.isInitialized) {
-        await ensureBootstrapReady('stats alerts request');
-      }
+      await prepareReadCache('stats alerts request');
 
-      const since = new Date(Date.now() - config.lookbackMs).toISOString();
-      const alerts = hydrateAlertsBatch(database.getAlertsSince(since))
-        .map((hydratedAlert) => {
-          const alert = applySimulationModeToAlert(
-            hydratedAlert,
-            config.simulationsEnabled,
-          );
-          if (!alert) {
-            return null;
-          }
-          const payload: StatsAlert = {
-            created_at: resolveAlertHistoryAt(alert),
-            kind: typeof alert.kind === 'string' ? alert.kind : undefined,
-            scenario: resolveAlertScenario(alert),
-            source: alert.source
-              ? {
-                  ip: alert.source.ip,
-                  value: alert.source.value,
-                  range: alert.source.range,
-                  cn: alert.source.cn,
-                  as_name: alert.source.as_name,
-                  scope: alert.source.scope,
-                }
-              : null,
-            target: alert.target,
-            simulated: isAlertSimulated(alert),
-          };
-          return payload;
-        })
-        .filter((alert): alert is StatsAlert => alert !== null)
-        .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
+      const where = createSqlWhere();
+      where.add('created_at >= ?', new Date(Date.now() - config.lookbackMs).toISOString());
+      if (!config.simulationsEnabled) {
+        where.add('simulated = 0');
+      }
+      const alerts = (await queryWorker.all<{
+        created_at: string;
+        scenario?: string | null;
+        source_ip?: string | null;
+        country?: string | null;
+        as_name?: string | null;
+        target?: string | null;
+        simulated?: number | null;
+      }>(`
+        SELECT created_at, scenario, source_ip, country, as_name, target, simulated
+        FROM alerts
+        ${where.toSql()}
+        ORDER BY created_at DESC, id DESC
+      `, where.params)).map((row): StatsAlert => ({
+        created_at: row.created_at,
+        scenario: row.scenario || undefined,
+        source: row.source_ip || row.country || row.as_name
+          ? {
+              ip: row.source_ip && !row.source_ip.includes('/') ? row.source_ip : undefined,
+              value: row.source_ip || undefined,
+              range: row.source_ip && row.source_ip.includes('/') ? row.source_ip : undefined,
+              cn: row.country || undefined,
+              as_name: row.as_name || undefined,
+            }
+          : null,
+        target: row.target || undefined,
+        simulated: row.simulated === 1,
+      }));
 
       return context.json(alerts);
     } catch (error: any) {
+      if (error instanceof QueryWorkerTimeoutError) {
+        console.warn('Timed out serving stats alerts from database:', error.message);
+        return context.json({ error: 'Alert statistics query timed out' }, 504);
+      }
       console.error('Error serving stats alerts from database:', error.message);
       return context.json({ error: 'Failed to retrieve alert statistics' }, 500);
     }
@@ -1013,32 +1090,43 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         await updateCache();
       }
 
-      if (!cache.isInitialized) {
-        await ensureBootstrapReady('stats decisions request');
-      }
+      await prepareReadCache('stats decisions request');
 
-      const since = new Date(Date.now() - config.lookbackMs).toISOString();
       const now = new Date().toISOString();
-      const decisions = database
-        .getDecisionsSince(since, now)
-        .map((row) => {
-          const decision = JSON.parse(row.raw_data) as Record<string, unknown>;
-          const payload: StatsDecision = {
-            id: decision.id as string | number,
-            created_at: String(decision.created_at || ''),
-            scenario: typeof decision.scenario === 'string' ? decision.scenario : undefined,
-            value: typeof decision.value === 'string' ? decision.value : undefined,
-            stop_at: typeof decision.stop_at === 'string' ? decision.stop_at : undefined,
-            target: typeof decision.target === 'string' ? decision.target : undefined,
-            simulated: normalizeDecisionSimulated(decision),
-          };
-          return payload;
-        })
-        .filter((decision) => config.simulationsEnabled || !decision.simulated)
-        .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
+      const where = createSqlWhere();
+      where.add('(created_at >= ? OR stop_at > ?)', new Date(Date.now() - config.lookbackMs).toISOString(), now);
+      if (!config.simulationsEnabled) {
+        where.add('simulated = 0');
+      }
+      const decisions = (await queryWorker.all<{
+        id: string | number;
+        created_at: string;
+        scenario?: string | null;
+        value?: string | null;
+        stop_at?: string | null;
+        target?: string | null;
+        simulated?: number | null;
+      }>(`
+        SELECT id, created_at, scenario, value, stop_at, target, simulated
+        FROM decisions
+        ${where.toSql()}
+        ORDER BY created_at DESC, id DESC
+      `, where.params)).map((row): StatsDecision => ({
+        id: row.id,
+        created_at: row.created_at,
+        scenario: row.scenario || undefined,
+        value: row.value || undefined,
+        stop_at: row.stop_at || undefined,
+        target: row.target || undefined,
+        simulated: row.simulated === 1,
+      }));
 
       return context.json(decisions);
     } catch (error: any) {
+      if (error instanceof QueryWorkerTimeoutError) {
+        console.warn('Timed out serving stats decisions from database:', error.message);
+        return context.json({ error: 'Decision statistics query timed out' }, 504);
+      }
       console.error('Error serving stats decisions from database:', error.message);
       return context.json({ error: 'Failed to retrieve decision statistics' }, 500);
     }
@@ -1050,12 +1138,27 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         await updateCache();
       }
 
-      if (!cache.isInitialized) {
-        await ensureBootstrapReady('dashboard stats request');
+      await prepareReadCache('dashboard stats request');
+      const filters = getDashboardStatsFilters(context, config.timeZone);
+      if (shouldServeEmptyDashboardStats()) {
+        warmDashboardStatsCache(filters);
+        const staleResponse = staleDashboardStatsResponseCache.get(getStaleDashboardStatsResponseCacheKey(filters));
+        if (staleResponse) {
+          return context.json({
+            ...staleResponse,
+            pending: true,
+            retryAfterMs: 1_500,
+          });
+        }
+        return context.json(createEmptyDashboardStatsResponse({ pending: true }));
       }
 
-      return context.json(buildDashboardStats(getDashboardStatsFilters(context, config.timeZone)));
+      return context.json(await buildDashboardStats(filters));
     } catch (error: any) {
+      if (error instanceof QueryWorkerTimeoutError) {
+        console.warn('Timed out serving dashboard statistics from database:', error.message);
+        return context.json({ error: 'Dashboard statistics query timed out' }, 504);
+      }
       console.error('Error serving dashboard statistics from database:', error.message);
       return context.json({ error: 'Failed to retrieve dashboard statistics' }, 500);
     }
@@ -1117,7 +1220,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         return context.json({ error: 'Decision IDs must be numeric' }, 400);
       }
 
-      const result = await deleteDecisionsByIds(ids);
+      const result = await deleteDecisionsByIdsInChunks(ids);
       if (result.deleted_decisions > 0) {
         void runNotificationEvaluation('bulk decision delete');
       }
@@ -1144,7 +1247,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       const result = await deleteDecisionFromLapi(decisionId);
       console.log(`Removing decision ${decisionId} from local cache...`);
       database.deleteDecision(decisionId);
-      dashboardStatsCache = null;
+      invalidateDashboardStatsCache();
       void runNotificationEvaluation('decision delete');
       return context.json((result as object) || { message: 'Deleted' });
     };
@@ -1189,6 +1292,11 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     return context.text('Not Found', 404);
   });
 
+  app.use(`${config.basePath}/world-50m.json`, async (context, next) => {
+    context.header('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+    await next();
+  });
+
   staticFiles.forEach((file) => {
     app.use(
       `${config.basePath}${file}`,
@@ -1216,10 +1324,18 @@ export function createApp(options: CreateAppOptions = {}): AppController {
 
   app.get(`${config.basePath}/*`, (context) => {
     try {
+      const requestPath = new URL(context.req.url).pathname;
+      const rootPath = config.basePath ? `${config.basePath}/` : '/';
+      if (options.rootRedirectPath && requestPath === rootPath) {
+        const redirectPath = `${config.basePath}${options.rootRedirectPath.startsWith('/') ? options.rootRedirectPath : `/${options.rootRedirectPath}`}`;
+        return context.redirect(redirectPath);
+      }
+
       const indexPath = path.join(distRoot, 'index.html');
       let html = fs.readFileSync(indexPath, 'utf-8');
       const safePath = config.basePath.replace(/[^a-zA-Z0-9/_-]/g, '');
-      const configScript = `<script>window.__BASE_PATH__="${safePath}";</script>`;
+      const cspNonce = String((context as HonoContext).get('cspNonce') || '');
+      const configScript = `<script nonce="${cspNonce}">window.__BASE_PATH__="${safePath}";</script>`;
       html = html.replace('</head>', `${configScript}\n</head>`);
 
       if (config.basePath) {
@@ -1250,6 +1366,10 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     } catch (error: any) {
       console.error(`Notification evaluation failed during ${source}:`, error.message);
     }
+  }
+
+  async function refreshDecisionDuplicateFlags(): Promise<void> {
+    await syncWorker.refreshDecisionDuplicateFlags(new Date().toISOString());
   }
 
   function getLegacyAlertSyncQueries(): AlertSyncQuery[] {
@@ -1457,13 +1577,17 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     return origin !== CAPI_ALERT_ORIGIN;
   }
 
-  function pruneCachedEntriesForCurrentAlertFilters(): { alerts: number; decisions: number } {
-    const cachedAlerts = database.getAllAlerts();
+  async function pruneCachedEntriesForCurrentAlertFilters(): Promise<{ alerts: number; decisions: number }> {
+    const cachedAlerts = await queryWorker.all<{ raw_data: string }>('SELECT raw_data FROM alerts');
     const allAlertIds = new Set<string>();
     const staleAlertIds: string[] = [];
     const staleAlertIdSet = new Set<string>();
 
-    for (const row of cachedAlerts) {
+    for (let index = 0; index < cachedAlerts.length; index += 1) {
+      if (index > 0 && index % SYNC_WRITE_BATCH_SIZE === 0) {
+        await delay(0);
+      }
+      const row = cachedAlerts[index];
       try {
         const alert = JSON.parse(row.raw_data) as AlertRecord;
         if (!alert?.id) {
@@ -1482,10 +1606,18 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     }
 
     const remainingAlertIds = new Set([...allAlertIds].filter((id) => !staleAlertIdSet.has(id)));
-    const prunedAlerts = database.deleteCachedAlerts(staleAlertIds);
+    const prunedAlerts = await syncWorker.deleteCachedAlerts(staleAlertIds);
     const staleDecisionIds: string[] = [];
+    const cachedDecisions = await queryWorker.all<{
+      raw_data: string;
+      alert_id?: string | number | null;
+    }>('SELECT raw_data, alert_id FROM decisions');
 
-    for (const row of database.getAllDecisions()) {
+    for (let index = 0; index < cachedDecisions.length; index += 1) {
+      if (index > 0 && index % SYNC_WRITE_BATCH_SIZE === 0) {
+        await delay(0);
+      }
+      const row = cachedDecisions[index];
       try {
         const decision = JSON.parse(row.raw_data) as { id?: string | number; alert_id?: string | number; origin?: unknown };
         if (decision.id === undefined || decision.id === null) {
@@ -1506,14 +1638,13 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       }
     }
 
-    const orphanDecisions = database.deleteCachedDecisions(staleDecisionIds);
+    const orphanDecisions = await syncWorker.deleteCachedDecisions(staleDecisionIds);
     const pruned = {
       alerts: prunedAlerts.alerts,
       decisions: prunedAlerts.decisions + orphanDecisions,
     };
 
     if (pruned.alerts > 0 || pruned.decisions > 0) {
-      dashboardStatsCache = null;
       console.log(`Alert filter cleanup: removed ${pruned.alerts} stale cached alerts and ${pruned.decisions} stale cached decisions.`);
     }
 
@@ -1550,8 +1681,8 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       .filter((alert) => !shouldExcludeAlertByOrigin(alert));
   }
 
-  function processAlertForDatabase(alert: AlertRecord): void {
-    if (!alert || !alert.id) return;
+  function buildAlertMutation(alert: AlertRecord): SyncAlertMutation | null {
+    if (!alert || !alert.id) return null;
     const decisions = alert.decisions || [];
     const alertSource = alert.source || null;
     const sourceValue = getAlertSourceValue(alertSource);
@@ -1580,17 +1711,11 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       $source_ip: sourceValue,
       $message: alert.message || '',
       $raw_data: JSON.stringify(enrichedAlert),
+      $record: enrichedAlert,
     };
 
-    try {
-      database.insertAlert(alertData);
-    } catch (error: any) {
-      if (!String(error.message).includes('UNIQUE constraint')) {
-        console.error(`Failed to insert alert ${alert.id}:`, error.message);
-      }
-    }
-
     const currentDecisionIds: string[] = [];
+    const decisionData: DecisionInsertParams[] = [];
     const observedAt = new Date().toISOString();
     for (const decision of normalizedDecisions) {
       currentDecisionIds.push(String(decision.id));
@@ -1614,7 +1739,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         is_duplicate: false,
       };
 
-      const decisionData: DecisionInsertParams = {
+      decisionData.push({
         $id: String(decision.id),
         $uuid: String(decision.id),
         $alert_id: alert.id,
@@ -1625,16 +1750,15 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         $origin: enrichedDecision.origin,
         $scenario: enrichedDecision.scenario,
         $raw_data: JSON.stringify(enrichedDecision),
-      };
-
-      try {
-        database.insertDecision(decisionData);
-      } catch (error: any) {
-        console.error(`Failed to insert decision ${decision.id}:`, error.message);
-      }
+        $record: enrichedDecision,
+      });
     }
 
-    database.deleteDecisionsByAlertIdExcept(alert.id, currentDecisionIds);
+    return {
+      alert: alertData,
+      decisions: decisionData,
+      keepDecisionIds: currentDecisionIds,
+    };
   }
 
   function resolveDecisionStopAt(decision: AlertDecision, createdAt: string, observedAt: string): string {
@@ -1650,51 +1774,80 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     return createdAt;
   }
 
-  function reconcileSyncedAlertWindow(alerts: AlertRecord[], start: string, end: string): { alerts: number; decisions: number } {
-    let pruned = { alerts: 0, decisions: 0 };
+  async function reconcileSyncedAlertWindow(
+    alerts: AlertRecord[],
+    start: string,
+    end: string,
+  ): Promise<{ alerts: number; decisions: number; changed: boolean }> {
+    let changed = false;
     const keepIds = alerts.map((alert) => alert.id);
-    const reconcileTransaction = database.transaction<AlertRecord[]>((items) => {
-      for (const alert of items) {
-        processAlertForDatabase(alert);
-      }
-      pruned = database.deleteAlertsMissingBetween(start, end, keepIds);
-    });
 
-    reconcileTransaction(alerts);
-    if (pruned.alerts > 0 || pruned.decisions > 0) {
-      dashboardStatsCache = null;
+    for (let offset = 0; offset < alerts.length; offset += SYNC_WRITE_BATCH_SIZE) {
+      const mutations = alerts
+        .slice(offset, offset + SYNC_WRITE_BATCH_SIZE)
+        .map(buildAlertMutation)
+        .filter((mutation): mutation is SyncAlertMutation => mutation !== null);
+      const result = await syncWorker.persistAlerts(mutations);
+      changed = result.changed || changed;
     }
-    return pruned;
+    const pruned = await syncWorker.deleteAlertsMissingBetween(start, end, keepIds);
+    return {
+      ...pruned,
+      changed: changed || pruned.alerts > 0 || pruned.decisions > 0,
+    };
   }
 
-  function reconcileActiveDecisionIds(keepIds: Array<string | number>, now: string): { alerts: number; decisions: number } {
-    let pruned = { alerts: 0, decisions: 0 };
+  async function reconcileActiveDecisionIds(
+    keepIds: Array<string | number>,
+    now: string,
+  ): Promise<{ alerts: number; decisions: number; changed: boolean }> {
     const since = new Date(Date.now() - config.lookbackMs).toISOString();
-    const reconcileTransaction = database.transaction<Array<string | number>>((ids) => {
-      pruned = database.deleteActiveAlertsMissing(ids, now, since);
-    });
-
-    reconcileTransaction(keepIds);
-    if (pruned.alerts > 0 || pruned.decisions > 0) {
-      dashboardStatsCache = null;
+    const keepSet = new Set(keepIds.map(String));
+    const cachedActiveIds = await queryWorker.all<{ id: string | number }>(`
+      SELECT DISTINCT active.alert_id AS id
+      FROM decisions AS active INDEXED BY idx_decisions_stop_alert_id
+      WHERE active.stop_at > ?
+        AND active.alert_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM alerts
+          WHERE alerts.id = active.alert_id
+            AND alerts.created_at >= ?
+        )
+    `, [now, since]);
+    const staleIds = cachedActiveIds
+      .map((row) => String(row.id))
+      .filter((id) => !keepSet.has(id));
+    const pruned = { alerts: 0, decisions: 0 };
+    for (let offset = 0; offset < staleIds.length; offset += SYNC_WRITE_BATCH_SIZE) {
+      const result = await syncWorker.deleteCachedAlerts(staleIds.slice(offset, offset + SYNC_WRITE_BATCH_SIZE));
+      pruned.alerts += result.alerts;
+      pruned.decisions += result.decisions;
     }
-    return pruned;
+    return {
+      ...pruned,
+      changed: pruned.alerts > 0 || pruned.decisions > 0,
+    };
   }
 
-  function persistAndIndexActiveDecisionAlerts(alerts: AlertRecord[]): Map<string, number> {
+  async function persistAndIndexActiveDecisionAlerts(
+    alerts: AlertRecord[],
+  ): Promise<{ decisionCountsByAlertId: Map<string, number>; changed: boolean }> {
     const decisionCountsByAlertId = new Map<string, number>();
-    const persistTransaction = database.transaction<AlertRecord[]>((items) => {
-      for (const alert of items) {
-        processAlertForDatabase(alert);
-        decisionCountsByAlertId.set(String(alert.id), Array.isArray(alert.decisions) ? alert.decisions.length : 0);
-      }
-    });
-
-    persistTransaction(alerts);
-    if (alerts.length > 0) {
-      dashboardStatsCache = null;
+    let changed = false;
+    for (const alert of alerts) {
+      decisionCountsByAlertId.set(String(alert.id), Array.isArray(alert.decisions) ? alert.decisions.length : 0);
     }
-    return decisionCountsByAlertId;
+
+    for (let offset = 0; offset < alerts.length; offset += SYNC_WRITE_BATCH_SIZE) {
+      const mutations = alerts
+        .slice(offset, offset + SYNC_WRITE_BATCH_SIZE)
+        .map(buildAlertMutation)
+        .filter((mutation): mutation is SyncAlertMutation => mutation !== null);
+      const result = await syncWorker.persistAlerts(mutations);
+      changed = result.changed || changed;
+    }
+    return { decisionCountsByAlertId, changed };
   }
 
   function mergeActiveDecisionCounts(
@@ -1714,16 +1867,6 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       total += count;
     }
     return total;
-  }
-
-  function persistSyncedAlerts(alerts: AlertRecord[]): void {
-    const persistTransaction = database.transaction<AlertRecord[]>((items) => {
-      for (const alert of items) {
-        processAlertForDatabase(alert);
-      }
-    });
-
-    persistTransaction(alerts);
   }
 
   function mergeAlertRecords(alerts: AlertRecord[]): AlertRecord[] {
@@ -1746,6 +1889,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       decisions: left.decisions + right.decisions,
       errors: [...left.errors, ...right.errors],
       successfulWindows: left.successfulWindows + right.successfulWindows,
+      changed: left.changed || right.changed,
     };
   }
 
@@ -1754,6 +1898,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       decisionCountsByAlertId: mergeActiveDecisionCounts(left.decisionCountsByAlertId, right.decisionCountsByAlertId),
       errors: [...left.errors, ...right.errors],
       successfulWindows: left.successfulWindows + right.successfulWindows,
+      changed: left.changed || right.changed,
     };
   }
 
@@ -1778,7 +1923,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     try {
       const alerts = await fetchAlertsForSync(sinceDuration, untilDuration, false, { requireComplete: true });
       const decisionCount = countAlertDecisions(alerts);
-      const pruned = reconcileSyncedAlertWindow(
+      const pruned = await reconcileSyncedAlertWindow(
         alerts,
         new Date(startMs).toISOString(),
         new Date(endMs).toISOString(),
@@ -1795,6 +1940,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         decisions: decisionCount,
         errors: [],
         successfulWindows: 1,
+        changed: pruned.changed,
       };
     } catch (error: any) {
       if (isTimeoutError(error) && canSplitWindow(startMs, endMs)) {
@@ -1812,6 +1958,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         decisions: 0,
         errors: [errorMessage],
         successfulWindows: 0,
+        changed: false,
       };
     }
   }
@@ -1824,11 +1971,12 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     try {
       const alerts = await fetchAlertsForSync(sinceDuration, untilDuration, true, { requireComplete: true });
       const activeAlerts = mergeAlertRecords(alerts);
-      const decisionCountsByAlertId = persistAndIndexActiveDecisionAlerts(activeAlerts);
+      const persisted = await persistAndIndexActiveDecisionAlerts(activeAlerts);
       return {
-        decisionCountsByAlertId,
+        decisionCountsByAlertId: persisted.decisionCountsByAlertId,
         errors: [],
         successfulWindows: 1,
+        changed: persisted.changed,
       };
     } catch (error: any) {
       if (isTimeoutError(error) && canSplitWindow(startMs, endMs)) {
@@ -1845,6 +1993,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         decisionCountsByAlertId: new Map(),
         errors: [errorMessage],
         successfulWindows: 0,
+        changed: false,
       };
     }
   }
@@ -1855,12 +2004,14 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       decisionCountsByAlertId: new Map(),
       errors: [],
       successfulWindows: 0,
+      changed: false,
     };
     while (currentStart < now) {
       const currentEnd = Math.min(currentStart + config.alertSyncChunkMs, now);
       const windowSummary = await fetchActiveDecisionWindow(currentStart, currentEnd, now);
       summary = combineActiveWindowSummaries(summary, windowSummary);
       currentStart = currentEnd;
+      await delay(0);
     }
     return summary;
   }
@@ -1897,8 +2048,10 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     let activePrunedAlerts = 0;
     let activePrunedDecisions = 0;
     let activeErrors: string[] = [];
+    let changed = false;
 
-    const filterPruned = pruneCachedEntriesForCurrentAlertFilters();
+    const filterPruned = await pruneCachedEntriesForCurrentAlertFilters();
+    changed = filterPruned.alerts > 0 || filterPruned.decisions > 0;
     if (filterPruned.alerts > 0 || filterPruned.decisions > 0) {
       updateSyncStatus({
         message: t('components.syncOverlay.statusRemovedStale', {
@@ -1930,6 +2083,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       totalDecisions += result.decisions;
       successfulWindows += result.successfulWindows;
       historicalErrors.push(...result.errors);
+      changed = result.changed || changed;
 
       currentStart = currentEnd;
       await delay(100);
@@ -1940,6 +2094,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     const cachedAlertsBeforeActiveSync = database.countAlerts();
     const cachedDecisionsBeforeActiveSync = database.countDecisions();
     const activeWindowSummary = await fetchActiveDecisionAlerts(lookbackStart, now);
+    changed = activeWindowSummary.changed || changed;
     const activeDecisionCountsByAlertId = activeWindowSummary.decisionCountsByAlertId;
     activeDecisionAlertsCount = activeDecisionCountsByAlertId.size;
     activeDecisionsCount = countIndexedDecisions(activeDecisionCountsByAlertId);
@@ -1947,9 +2102,10 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     activeErrors = activeWindowSummary.errors;
 
     if (activeErrors.length === 0) {
-      const pruned = reconcileActiveDecisionIds(Array.from(activeDecisionCountsByAlertId.keys()), new Date().toISOString());
+      const pruned = await reconcileActiveDecisionIds(Array.from(activeDecisionCountsByAlertId.keys()), new Date().toISOString());
       activePrunedAlerts = pruned.alerts;
       activePrunedDecisions = pruned.decisions;
+      changed = pruned.changed || changed;
     }
     activeNetCachedAlerts = database.countAlerts() - cachedAlertsBeforeActiveSync;
     activeNetCachedDecisions = database.countDecisions() - cachedDecisionsBeforeActiveSync;
@@ -1975,10 +2131,12 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     console.log(logMessage);
 
     updateSyncStatus({
-      isSyncing: false,
+      // Keep the initial overlay open until initializeCache has finalized all
+      // read-visible indexes and dashboard cache state.
+      isSyncing: showOverlay,
       progress: state === 'failed' ? 0 : 100,
       message,
-      completedAt: new Date().toISOString(),
+      completedAt: showOverlay ? null : new Date().toISOString(),
       state,
       errors,
     });
@@ -1998,6 +2156,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       errors,
       cachedAlerts,
       cachedDecisions,
+      changed,
     };
   }
 
@@ -2008,13 +2167,40 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     }
 
     initializationPromise = (async () => {
+      const deferSearchIndexUpdates = !cache.isInitialized && database.searchIndexAvailable;
+      let deferredSearchIndexesRebuilt = false;
+      if (deferSearchIndexUpdates) {
+        await syncWorker.beginDeferredSearchIndexUpdates();
+      }
       try {
         console.log('Initializing cache with chunked data load...');
         const syncSummary = await syncHistory();
+        await refreshDecisionDuplicateFlags();
+        if (deferSearchIndexUpdates) {
+          console.log('Rebuilding search indexes after initial cache load...');
+          const searchIndexStartedAt = Date.now();
+          await syncWorker.rebuildSearchIndexes();
+          deferredSearchIndexesRebuilt = true;
+          console.log(`Search indexes rebuilt in ${formatElapsedTime(Date.now() - searchIndexStartedAt)}.`);
+        }
+        if (syncSummary.changed) {
+          invalidateDashboardStatsCache();
+        }
         cache.lastUpdate = new Date().toISOString();
         cache.isInitialized = syncSummary.state !== 'failed';
         cache.isComplete = syncSummary.state === 'complete';
         lapiClient.updateStatus(syncSummary.state === 'complete', syncSummary.errors[0] ? { message: syncSummary.errors[0] } : null);
+        if (syncStatus.isSyncing && cache.isInitialized) {
+          try {
+            await getDashboardStatsIndex();
+          } catch (error: any) {
+            console.error('Failed to prepare dashboard data before completing initial sync:', error.message);
+          }
+        }
+        updateSyncStatus({
+          isSyncing: false,
+          completedAt: new Date().toISOString(),
+        });
         await runNotificationEvaluation('cache initialization');
         const activeDecisionChanged =
           syncSummary.activeNetCachedAlerts !== 0 ||
@@ -2061,6 +2247,13 @@ ${errorSummary}  Status: ${syncSummary.state}
         });
         return null;
       } finally {
+        if (deferSearchIndexUpdates && !deferredSearchIndexesRebuilt) {
+          try {
+            await syncWorker.rebuildSearchIndexes();
+          } catch (error: any) {
+            console.error('Failed to rebuild search indexes:', error.message);
+          }
+        }
         initializationPromise = null;
       }
     })();
@@ -2086,7 +2279,8 @@ ${errorSummary}  Status: ${syncSummary.state}
       const newAlerts = await fetchAlertsForSync(sinceDuration, null, false, { requireComplete: true });
       const newDecisionCount = countAlertDecisions(newAlerts);
 
-      const deltaPruned = reconcileSyncedAlertWindow(newAlerts, deltaStart, deltaEnd);
+      const deltaPruned = await reconcileSyncedAlertWindow(newAlerts, deltaStart, deltaEnd);
+      let changed = deltaPruned.changed;
       if (newAlerts.length > 0 || deltaPruned.alerts > 0 || deltaPruned.decisions > 0) {
         console.log(
           `Delta update: ${newAlerts.length} alerts and ${newDecisionCount} decisions synced, ${deltaPruned.alerts} stale alerts and ${deltaPruned.decisions} stale decisions pruned`,
@@ -2094,12 +2288,14 @@ ${errorSummary}  Status: ${syncSummary.state}
       }
 
       const activeWindowSummary = await fetchActiveDecisionAlerts(activeLookbackStart, deltaStartedAt);
+      changed = activeWindowSummary.changed || changed;
       const activeDecisionCountsByAlertId = activeWindowSummary.decisionCountsByAlertId;
       const activeDecisionAlertsCount = activeDecisionCountsByAlertId.size;
       const activeDecisionCount = countIndexedDecisions(activeDecisionCountsByAlertId);
       const activePruned = activeWindowSummary.errors.length === 0
-        ? reconcileActiveDecisionIds(Array.from(activeDecisionCountsByAlertId.keys()), new Date().toISOString())
-        : { alerts: 0, decisions: 0 };
+        ? await reconcileActiveDecisionIds(Array.from(activeDecisionCountsByAlertId.keys()), new Date().toISOString())
+        : { alerts: 0, decisions: 0, changed: false };
+      changed = activePruned.changed || changed;
       if (activeDecisionAlertsCount > 0 || activePruned.alerts > 0 || activePruned.decisions > 0) {
         console.log(
           `Active decision refresh: ${activeDecisionAlertsCount} alerts and ${activeDecisionCount} decisions synced, ${activePruned.alerts} stale alerts and ${activePruned.decisions} stale decisions pruned`,
@@ -2109,6 +2305,10 @@ ${errorSummary}  Status: ${syncSummary.state}
         throw new Error(`Active decision refresh incomplete: ${activeWindowSummary.errors.join('; ')}`);
       }
 
+      await refreshDecisionDuplicateFlags();
+      if (changed) {
+        invalidateDashboardStatsCache();
+      }
       cache.lastUpdate = new Date().toISOString();
       lapiClient.updateStatus(true);
       console.log(`Delta update complete: ${newAlerts.length} alerts and ${newDecisionCount} decisions synced, ${activeDecisionAlertsCount} active decision alerts and ${activeDecisionCount} decisions refreshed`);
@@ -2118,12 +2318,11 @@ ${errorSummary}  Status: ${syncSummary.state}
     }
   }
 
-  function cleanupOldData(): void {
+  async function cleanupOldData(): Promise<void> {
     const cutoff = new Date(Date.now() - config.lookbackMs).toISOString();
     try {
-      const removedAlerts = database.deleteOldAlerts(cutoff);
-      const removedDecisions = database.deleteOldDecisions(cutoff);
-      console.log(`Cleanup: Removed ${removedAlerts} old alerts, ${removedDecisions} old decisions`);
+      const removed = await syncWorker.cleanupOldData(cutoff);
+      console.log(`Cleanup: Removed ${removed.alerts} old alerts, ${removed.decisions} old decisions`);
     } catch (error: any) {
       console.error('Cleanup failed:', error.message);
     }
@@ -2131,7 +2330,7 @@ ${errorSummary}  Status: ${syncSummary.state}
 
   async function updateCache(): Promise<void> {
     await updateCacheDelta();
-    cleanupOldData();
+    await cleanupOldData();
     await runNotificationEvaluation('cache update');
   }
 
@@ -2168,6 +2367,22 @@ ${errorSummary}  Status: ${syncSummary.state}
     }, config.bootstrapRetryDelayMs);
   }
 
+  async function prepareReadCache(source: string): Promise<void> {
+    if (cache.isInitialized) {
+      return;
+    }
+
+    if (bootstrapPromise && isBackgroundBootstrapSource(bootstrapSource)) {
+      return;
+    }
+
+    await ensureBootstrapReady(source);
+  }
+
+  function isBackgroundBootstrapSource(source: string | null): boolean {
+    return source === 'startup' || source === 'bootstrap retry';
+  }
+
   async function ensureBootstrapReady(source = 'bootstrap'): Promise<boolean> {
     if (!lapiClient.hasAuthConfig()) {
       return false;
@@ -2187,6 +2402,7 @@ ${errorSummary}  Status: ${syncSummary.state}
       return bootstrapPromise;
     }
 
+    bootstrapSource = source;
     bootstrapPromise = (async () => {
       console.log(`Starting bootstrap recovery (${source})...`);
       if (!lapiClient.hasToken()) {
@@ -2220,6 +2436,7 @@ ${errorSummary}  Status: ${syncSummary.state}
       return await bootstrapPromise;
     } finally {
       bootstrapPromise = null;
+      bootstrapSource = null;
     }
   }
 
@@ -2541,27 +2758,11 @@ ${errorSummary}  Status: ${syncSummary.state}
   async function deleteAlertsByIds(ids: string[]): Promise<BulkDeleteResult> {
     const result = createDeleteResult({ requested_alerts: ids.length });
     const deletedAlertIds: string[] = [];
-    const deletedDecisionIds = new Set<string>();
-    const alertMap = new Map(getCachedAlertsForDeletion().map((alert) => [alert.id, alert]));
 
     for (const id of ids) {
       try {
         await deleteAlertFromLapi(id);
         deletedAlertIds.push(id);
-
-        const alert = alertMap.get(id);
-        if (alert) {
-          try {
-            const parsedAlert = JSON.parse(alert.raw_data) as AlertRecord;
-            for (const decision of parsedAlert.decisions || []) {
-              if (decision?.id !== undefined && decision?.id !== null) {
-                deletedDecisionIds.add(String(decision.id));
-              }
-            }
-          } catch {
-            // Ignore cache parse issues and still remove the alert row itself.
-          }
-        }
       } catch (error) {
         const typedError = error as AnyError;
         if (isPermissionError(typedError)) {
@@ -2571,6 +2772,7 @@ ${errorSummary}  Status: ${syncSummary.state}
       }
     }
 
+    const deletedDecisionIds = new Set(getDecisionIdsForAlertIds(deletedAlertIds));
     if (deletedAlertIds.length > 0) {
       const removeAlerts = database.transaction<string[]>((alertIds) => {
         for (const id of alertIds) {
@@ -2579,12 +2781,37 @@ ${errorSummary}  Status: ${syncSummary.state}
         }
       });
       removeAlerts(deletedAlertIds);
-      dashboardStatsCache = null;
+      invalidateDashboardStatsCache();
     }
 
     result.deleted_alerts = deletedAlertIds.length;
     result.deleted_decisions = deletedDecisionIds.size;
     return result;
+  }
+
+  async function deleteAlertsByIdsInChunks(ids: string[]): Promise<BulkDeleteResult> {
+    const aggregate = createDeleteResult({ requested_alerts: ids.length });
+    const chunkSize = 100;
+    for (let offset = 0; offset < ids.length; offset += chunkSize) {
+      const result = await deleteAlertsByIds(ids.slice(offset, offset + chunkSize));
+      aggregate.deleted_alerts += result.deleted_alerts;
+      aggregate.deleted_decisions += result.deleted_decisions;
+      aggregate.failed.push(...result.failed);
+    }
+    return aggregate;
+  }
+
+  function getDecisionIdsForAlertIds(alertIds: string[]): string[] {
+    const ids: string[] = [];
+    const chunkSize = 900;
+    for (let offset = 0; offset < alertIds.length; offset += chunkSize) {
+      const chunk = alertIds.slice(offset, offset + chunkSize);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = database.db.prepare(`SELECT id FROM decisions WHERE alert_id IN (${placeholders})`).all(...chunk) as Array<{ id: string | number }>;
+      ids.push(...rows.map((row) => String(row.id)));
+    }
+    return ids;
   }
 
   async function deleteDecisionsByIds(ids: string[]): Promise<BulkDeleteResult> {
@@ -2611,11 +2838,22 @@ ${errorSummary}  Status: ${syncSummary.state}
         }
       });
       removeDecisions(deletedDecisionIds);
-      dashboardStatsCache = null;
+      invalidateDashboardStatsCache();
     }
 
     result.deleted_decisions = deletedDecisionIds.length;
     return result;
+  }
+
+  async function deleteDecisionsByIdsInChunks(ids: string[]): Promise<BulkDeleteResult> {
+    const aggregate = createDeleteResult({ requested_decisions: ids.length });
+    const chunkSize = 100;
+    for (let offset = 0; offset < ids.length; offset += chunkSize) {
+      const result = await deleteDecisionsByIds(ids.slice(offset, offset + chunkSize));
+      aggregate.deleted_decisions += result.deleted_decisions;
+      aggregate.failed.push(...result.failed);
+    }
+    return aggregate;
   }
 
   async function deleteEntriesByIp(ip: string): Promise<BulkDeleteResult> {
@@ -2681,7 +2919,7 @@ ${errorSummary}  Status: ${syncSummary.state}
         }
       });
       removeAlerts(deletedAlertIds);
-      dashboardStatsCache = null;
+      invalidateDashboardStatsCache();
     }
 
     const decisionIdsToDelete = Array.from(deletedDecisionIds).filter((id) => !alertDecisionIds.has(id));
@@ -2692,7 +2930,7 @@ ${errorSummary}  Status: ${syncSummary.state}
         }
       });
       removeDecisions(decisionIdsToDelete);
-      dashboardStatsCache = null;
+      invalidateDashboardStatsCache();
     }
 
     result.deleted_alerts = deletedAlertIds.length;
@@ -2822,79 +3060,473 @@ ${errorSummary}  Status: ${syncSummary.state}
     return parsedAlerts.map((alert) => hydrateAlertWithDecisionsBatch(alert, stopAtMap));
   }
 
-  function getDashboardStatsIndex(): DashboardStatsCache {
-    const cacheKey = `${cache.lastUpdate || 'uninitialized'}:${config.lookbackMs}:${config.simulationsEnabled ? 'sim' : 'live'}`;
+  async function queryPaginatedAlerts(
+    pageRequest: PageRequest,
+    filters: AlertListFilters,
+    searchAst: SearchNode | null,
+  ): Promise<PaginatedResponse<SlimAlert>> {
+    const since = new Date(Date.now() - config.lookbackMs).toISOString();
+    const baseWhere = createSqlWhere();
+    baseWhere.add('created_at >= ?', since);
+    if (!config.simulationsEnabled) {
+      baseWhere.add('simulated = 0');
+    }
+
+    const filteredWhere = baseWhere.clone();
+    addAlertSqlFilters(filteredWhere, filters);
+    const searchWhere = compileAlertSearchSql(searchAst, filters);
+    if (searchWhere) {
+      filteredWhere.add(searchWhere.sql, ...searchWhere.params);
+    }
+
+    const unfilteredTotal = await queryCount('alerts', baseWhere);
+    const total = await queryCount('alerts', filteredWhere);
+    const offset = (pageRequest.page - 1) * pageRequest.pageSize;
+    const rows = await queryWorker.all<{ raw_data: string }>(`
+      SELECT raw_data
+      FROM alerts
+      ${filteredWhere.toSql()}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ? OFFSET ?
+    `, [...filteredWhere.params, pageRequest.pageSize, offset]);
+
+    const data = hydrateAlertsBatch(rows)
+      .map((alert) => applySimulationModeToAlert(alert, config.simulationsEnabled))
+      .filter((alert): alert is AlertRecord => alert !== null)
+      .map((alert) => toSlimAlert(alert));
+
+    return {
+      data,
+      pagination: {
+        page: pageRequest.page,
+        page_size: pageRequest.pageSize,
+        total,
+        total_pages: Math.ceil(total / pageRequest.pageSize),
+        unfiltered_total: unfilteredTotal,
+      },
+      selectable_ids: data.map((alert) => alert.id),
+    };
+  }
+
+  async function queryPaginatedDecisions(
+    pageRequest: PageRequest,
+    filters: DecisionListFilters,
+    searchAst: SearchNode | null,
+    includeExpired: boolean,
+  ): Promise<PaginatedResponse<DecisionListItem>> {
+    const since = new Date(Date.now() - config.lookbackMs).toISOString();
+    const now = new Date().toISOString();
+    const duplicateSql = getDecisionDuplicateSql(now);
+    const baseWhere = createSqlWhere();
+    if (includeExpired) {
+      baseWhere.add('(created_at >= ? OR stop_at > ?)', since, now);
+    } else {
+      baseWhere.add('stop_at > ?', now);
+    }
+    if (!config.simulationsEnabled) {
+      baseWhere.add('simulated = 0');
+    }
+
+    const filteredWhere = baseWhere.clone();
+    addDecisionSqlFilters(filteredWhere, filters, now, duplicateSql, true, !includeExpired);
+    const searchWhere = compileDecisionSearchSql(searchAst, filters, now, duplicateSql);
+    if (searchWhere) {
+      filteredWhere.add(searchWhere.sql, ...searchWhere.params);
+    }
+
+    const unfilteredTotal = await queryCount('decisions', baseWhere);
+    const total = await queryCount('decisions', filteredWhere);
+    const offset = (pageRequest.page - 1) * pageRequest.pageSize;
+    const decisionsTable = shouldUseDefaultDecisionPagingIndex(filters, searchAst, includeExpired)
+      ? 'decisions INDEXED BY idx_decisions_duplicate_created_at'
+      : 'decisions';
+    const rows = await queryWorker.all<{
+      raw_data: string;
+      alert_id?: string | number | null;
+      is_duplicate?: number;
+    }>(`
+      SELECT raw_data, alert_id, ${duplicateSql} AS is_duplicate
+      FROM ${decisionsTable}
+      ${filteredWhere.toSql()}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ? OFFSET ?
+    `, [...filteredWhere.params, pageRequest.pageSize, offset]);
+
+    const data = rows.map((row) => {
+      const decision = JSON.parse(row.raw_data) as AlertDecision & Record<string, unknown>;
+      if (decision.alert_id === undefined && row.alert_id !== undefined && row.alert_id !== null) {
+        decision.alert_id = row.alert_id;
+      }
+      decision.is_duplicate = row.is_duplicate === 1;
+      return toDecisionListItem(decision, includeExpired);
+    });
+
+    return {
+      data,
+      pagination: {
+        page: pageRequest.page,
+        page_size: pageRequest.pageSize,
+        total,
+        total_pages: Math.ceil(total / pageRequest.pageSize),
+        unfiltered_total: unfilteredTotal,
+      },
+      selectable_ids: data
+        .filter((decision) => !isDecisionListItemExpired(decision))
+        .map((decision) => decision.id),
+    };
+  }
+
+  async function queryCount(tableName: 'alerts' | 'decisions', where: SqlWhere): Promise<number> {
+    const row = await queryWorker.get<{ count: number }>(`SELECT COUNT(*) AS count FROM ${tableName} ${where.toSql()}`, where.params);
+    return row.count;
+  }
+
+  function shouldUseDefaultDecisionPagingIndex(filters: DecisionListFilters, searchAst: SearchNode | null, includeExpired: boolean): boolean {
+    return !includeExpired &&
+      !searchAst &&
+      !filters.showDuplicates &&
+      !filters.q &&
+      !filters.alertId &&
+      !filters.country &&
+      !filters.scenario &&
+      !filters.as &&
+      !filters.ip &&
+      !filters.target &&
+      !filters.dateStart &&
+      !filters.dateEnd &&
+      filters.simulation === 'all';
+  }
+
+  function addAlertSqlFilters(where: SqlWhere, filters: AlertListFilters): void {
+    if (filters.ip) addIpCondition(where, 'source_ip', filters.ip);
+    if (filters.country) {
+      where.add('(LOWER(country) LIKE ? OR LOWER(country_name) LIKE ?)', likeParam(filters.country), likeParam(filters.country));
+    }
+    if (filters.scenario) addLike(where, 'LOWER(scenario)', filters.scenario);
+    if (filters.as) addLike(where, 'LOWER(as_name)', filters.as);
+    if (filters.target) addLike(where, 'LOWER(target)', filters.target);
+    if (filters.date) where.add('created_at LIKE ?', `${escapeLike(filters.date)}%`);
+    addDateRangeFilter(where, 'created_at', filters.dateStart, filters.dateEnd, filters.timezoneOffsetMinutes, filters.timeZone);
+    addSimulationFilter(where, filters.simulation);
+  }
+
+  function addDecisionSqlFilters(
+    where: SqlWhere,
+    filters: DecisionListFilters,
+    now: string,
+    duplicateSql: string,
+    includeDuplicateFilter: boolean,
+    activeOnly = false,
+  ): void {
+    if (includeDuplicateFilter && !filters.showDuplicates) {
+      if (activeOnly) {
+        where.add('is_duplicate = 0');
+      } else {
+        where.add(`NOT (${duplicateSql})`);
+      }
+    }
+    if (filters.alertId) where.add('CAST(alert_id AS TEXT) = ?', filters.alertId);
+    addSimulationFilter(where, filters.simulation);
+    if (filters.country) where.add('country = ?', filters.country);
+    if (filters.scenario) where.add('scenario = ?', filters.scenario);
+    if (filters.as) where.add('as_name = ?', filters.as);
+    if (filters.ip) addIpCondition(where, 'value', filters.ip);
+    if (filters.target) {
+      where.add('(LOWER(value) LIKE ? OR LOWER(target) LIKE ?)', likeParam(filters.target), likeParam(filters.target));
+    }
+    addDateRangeFilter(where, 'created_at', filters.dateStart, filters.dateEnd, filters.timezoneOffsetMinutes, filters.timeZone);
+    void now;
+  }
+
+  function addSimulationFilter(where: SqlWhere, filter: string): void {
+    if (filter === 'simulated') where.add('simulated = 1');
+    if (filter === 'live') where.add('simulated = 0');
+  }
+
+  function addDateRangeFilter(
+    where: SqlWhere,
+    column: string,
+    dateStart: string,
+    dateEnd: string,
+    timezoneOffsetMinutes: number,
+    timeZone: string | null,
+  ): void {
+    if (!dateStart && !dateEnd) return;
+    const includeHour = dateStart.includes('T') || dateEnd.includes('T');
+    if (dateStart) {
+      where.add(`${column} >= ?`, getDateFilterBoundary(dateStart, timezoneOffsetMinutes, timeZone, includeHour).toISOString());
+    }
+    if (dateEnd) {
+      where.add(`${column} <= ?`, getDateFilterBoundary(dateEnd, timezoneOffsetMinutes, timeZone, includeHour).toISOString());
+    }
+  }
+
+  function compileAlertSearchSql(ast: SearchNode | null, filters: AlertListFilters): SqlCondition | null {
+    return compileSearchNodeSql(ast, {
+      page: 'alerts',
+      dateOptions: filters,
+      fieldCondition: (field, value) => alertFieldCondition(field, value),
+      freeTextCondition: (value) => freeTextSearchCondition('alerts', value, database.searchIndexAvailable),
+    });
+  }
+
+  function compileDecisionSearchSql(
+    ast: SearchNode | null,
+    filters: DecisionListFilters,
+    now: string,
+    duplicateSql: string,
+  ): SqlCondition | null {
+    return compileSearchNodeSql(ast, {
+      page: 'decisions',
+      dateOptions: filters,
+      fieldCondition: (field, value) => decisionFieldCondition(field, value, now, duplicateSql),
+      freeTextCondition: (value) => freeTextSearchCondition('decisions', value, database.searchIndexAvailable),
+    });
+  }
+
+  async function getDashboardStatsIndex(): Promise<DashboardStatsCache> {
+    const cacheKey = getDashboardStatsCacheKey();
     if (dashboardStatsCache?.key === cacheKey) {
       return dashboardStatsCache;
     }
 
+    const pending = dashboardStatsIndexPromises.get(cacheKey);
+    if (pending) {
+      return pending;
+    }
+
+    const promise = buildDashboardStatsIndex(cacheKey).finally(() => {
+      dashboardStatsIndexPromises.delete(cacheKey);
+    });
+    dashboardStatsIndexPromises.set(cacheKey, promise);
+    return promise;
+  }
+
+  async function buildDashboardStatsIndex(cacheKey: string): Promise<DashboardStatsCache> {
     const since = new Date(Date.now() - config.lookbackMs).toISOString();
     const nowIso = new Date().toISOString();
     const nowTimestamp = Date.now();
 
-    const alerts = hydrateAlertsBatch(database.getAlertsSince(since))
-      .map((hydratedAlert) => applySimulationModeToAlert(hydratedAlert, config.simulationsEnabled))
-      .filter((alert): alert is AlertRecord => alert !== null)
-      .flatMap((alert): DashboardAlertStatsRecord[] => {
-        const createdAt = resolveAlertHistoryAt(alert);
+    const alertWhere = createSqlWhere();
+    alertWhere.add('created_at >= ?', since);
+    if (!config.simulationsEnabled) {
+      alertWhere.add('simulated = 0');
+    }
+    const alerts: DashboardAlertStatsRecord[] = [];
+    let simulatedAlerts = 0;
+    let lastAlertId = 0;
+    while (true) {
+      const batchWhere = alertWhere.clone();
+      batchWhere.add('id > ?', lastAlertId);
+      const alertRows = await queryWorker.all<{
+      id: number;
+      created_at: string;
+      country?: string | null;
+      scenario?: string | null;
+      as_name?: string | null;
+      source_ip?: string | null;
+      target?: string | null;
+      simulated?: number | null;
+    }>(`
+      SELECT id, created_at, country, scenario, as_name, source_ip, target, simulated
+      FROM alerts
+      ${batchWhere.toSql()}
+      ORDER BY id ASC
+      LIMIT ?
+    `, [...batchWhere.params, DASHBOARD_INDEX_BATCH_SIZE]);
+      if (alertRows.length === 0) {
+        break;
+      }
+
+      for (let index = 0; index < alertRows.length; index += 1) {
+        const row = alertRows[index];
+        const createdAt = row.created_at;
         const timestamp = Date.parse(createdAt);
         if (!Number.isFinite(timestamp)) {
-          return [];
+          continue;
         }
 
-        return [{
+        const simulated = row.simulated === 1;
+        if (simulated) {
+          simulatedAlerts += 1;
+        }
+
+        alerts.push({
           createdAt,
           timestamp,
-          country: alert.source?.cn,
-          scenario: resolveAlertScenario(alert),
-          asName: alert.source?.as_name,
-          ip: alert.source?.ip,
-          target: alert.target,
-          simulated: isAlertSimulated(alert),
-        }];
-      });
+          country: row.country || undefined,
+          scenario: row.scenario || undefined,
+          asName: row.as_name || undefined,
+          ip: row.source_ip || undefined,
+          target: row.target || undefined,
+          simulated,
+        });
+      }
 
-    const decisions = database
-      .getDecisionsSince(since, nowIso)
-      .flatMap((row): DashboardDecisionStatsRecord[] => {
-        try {
-          const decision = JSON.parse(row.raw_data) as Record<string, unknown>;
-          const createdAt = String(decision.created_at || row.created_at || '');
-          const timestamp = Date.parse(createdAt);
-          if (!Number.isFinite(timestamp)) {
-            return [];
-          }
+      lastAlertId = Number(alertRows[alertRows.length - 1]?.id || lastAlertId);
+      await delay(0);
+    }
 
-          const stopAt = typeof decision.stop_at === 'string' ? decision.stop_at : undefined;
-          const stopTimestamp = stopAt ? Date.parse(stopAt) : Number.NaN;
-          return [{
-            createdAt,
-            stopAt,
-            timestamp,
-            stopTimestamp: Number.isFinite(stopTimestamp) ? stopTimestamp : 0,
-            value: typeof decision.value === 'string' ? decision.value : undefined,
-            country: typeof decision.country === 'string' ? decision.country : undefined,
-            simulated: normalizeDecisionSimulated(decision as AlertDecision & Record<string, unknown>),
-          }];
-        } catch {
-          return [];
+    const decisionWhere = createSqlWhere();
+    decisionWhere.add('(created_at >= ? OR stop_at > ?)', since, nowIso);
+    if (!config.simulationsEnabled) {
+      decisionWhere.add('simulated = 0');
+    }
+    const decisions: DashboardDecisionStatsRecord[] = [];
+    let activeDecisions = 0;
+    let activeSimulatedDecisions = 0;
+    let lastDecisionRowId = 0;
+    while (true) {
+      const batchWhere = decisionWhere.clone();
+      batchWhere.add('rowid > ?', lastDecisionRowId);
+      const decisionRows = await queryWorker.all<{
+      rowid: number;
+      created_at: string;
+      stop_at?: string | null;
+      value?: string | null;
+      country?: string | null;
+      simulated?: number | null;
+    }>(`
+      SELECT rowid, created_at, stop_at, value, country, simulated
+      FROM decisions
+      ${batchWhere.toSql()}
+      ORDER BY rowid ASC
+      LIMIT ?
+    `, [...batchWhere.params, DASHBOARD_INDEX_BATCH_SIZE]);
+      if (decisionRows.length === 0) {
+        break;
+      }
+
+      for (let index = 0; index < decisionRows.length; index += 1) {
+        const row = decisionRows[index];
+        const createdAt = row.created_at;
+        const timestamp = Date.parse(createdAt);
+        if (!Number.isFinite(timestamp)) {
+          continue;
         }
-      })
-      .filter((decision) => config.simulationsEnabled || !decision.simulated);
+
+        const stopAt = row.stop_at || undefined;
+        const stopTimestamp = stopAt ? Date.parse(stopAt) : Number.NaN;
+        const normalizedStopTimestamp = Number.isFinite(stopTimestamp) ? stopTimestamp : 0;
+        const simulated = row.simulated === 1;
+        if (normalizedStopTimestamp > nowTimestamp) {
+          if (simulated) {
+            activeSimulatedDecisions += 1;
+          } else {
+            activeDecisions += 1;
+          }
+        }
+
+        decisions.push({
+          createdAt,
+          stopAt,
+          timestamp,
+          stopTimestamp: normalizedStopTimestamp,
+          value: row.value || undefined,
+          country: row.country || undefined,
+          simulated,
+        });
+      }
+
+      lastDecisionRowId = Number(decisionRows[decisionRows.length - 1]?.rowid || lastDecisionRowId);
+      await delay(0);
+    }
 
     const totals: DashboardStatsTotals = {
       alerts: alerts.length,
-      decisions: decisions.filter((decision) => !decision.simulated && decision.stopTimestamp > nowTimestamp).length,
-      simulatedAlerts: alerts.filter((alert) => alert.simulated).length,
-      simulatedDecisions: decisions.filter((decision) => decision.simulated && decision.stopTimestamp > nowTimestamp).length,
+      decisions: activeDecisions,
+      simulatedAlerts,
+      simulatedDecisions: activeSimulatedDecisions,
     };
 
-    dashboardStatsCache = { key: cacheKey, alerts, decisions, totals };
-    return dashboardStatsCache;
+    const statsCache = { key: cacheKey, alerts, decisions, totals };
+    if (cacheKey === getDashboardStatsCacheKey()) {
+      dashboardStatsCache = statsCache;
+    }
+    return statsCache;
   }
 
-  function buildDashboardStats(filters: DashboardStatsFilters): DashboardStatsResponse {
-    const statsIndex = getDashboardStatsIndex();
+  async function buildDashboardStats(filters: DashboardStatsFilters): Promise<DashboardStatsResponse> {
+    const statsIndex = await getDashboardStatsIndex();
+    const responseCacheKey = getDashboardStatsResponseCacheKey(statsIndex.key, filters);
+    const cachedResponse = dashboardStatsResponseCache.get(responseCacheKey);
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+
+    const pending = dashboardStatsResponsePromises.get(responseCacheKey);
+    if (pending) {
+      return pending;
+    }
+
+    const promise = buildDashboardStatsResponse(statsIndex, filters, responseCacheKey).finally(() => {
+      dashboardStatsResponsePromises.delete(responseCacheKey);
+    });
+    dashboardStatsResponsePromises.set(responseCacheKey, promise);
+    return promise;
+  }
+
+  function createEmptyDashboardStatsResponse(options: { pending?: boolean } = {}): DashboardStatsResponse {
+    const totals: DashboardStatsTotals = {
+      alerts: 0,
+      decisions: 0,
+      simulatedAlerts: 0,
+      simulatedDecisions: 0,
+    };
+
+    return {
+      pending: options.pending || undefined,
+      retryAfterMs: options.pending ? 1_500 : undefined,
+      totals,
+      filteredTotals: totals,
+      globalTotal: 0,
+      topTargets: [],
+      topCountries: [],
+      allCountries: [],
+      topScenarios: [],
+      topAS: [],
+      series: {
+        alertsHistory: [],
+        simulatedAlertsHistory: [],
+        decisionsHistory: [],
+        simulatedDecisionsHistory: [],
+        activeDecisionsHistory: [],
+        activeSimulatedDecisionsHistory: [],
+        unfilteredAlertsHistory: [],
+        unfilteredSimulatedAlertsHistory: [],
+        unfilteredDecisionsHistory: [],
+        unfilteredSimulatedDecisionsHistory: [],
+      },
+    };
+  }
+
+  function shouldServeEmptyDashboardStats(): boolean {
+    if (dashboardStatsCache?.key === getDashboardStatsCacheKey()) {
+      return false;
+    }
+
+    if (dashboardStatsIndexPromises.size > 0 || dashboardStatsResponsePromises.size > 0) {
+      return true;
+    }
+
+    try {
+      return database.countAlerts() + database.countDecisions() > DASHBOARD_COLD_BUILD_ROW_LIMIT;
+    } catch {
+      return false;
+    }
+  }
+
+  function warmDashboardStatsCache(filters: DashboardStatsFilters): void {
+    void buildDashboardStats(filters).catch((error: any) => {
+      console.error('Failed to warm dashboard statistics cache:', error.message);
+    });
+  }
+
+  async function buildDashboardStatsResponse(
+    statsIndex: DashboardStatsCache,
+    filters: DashboardStatsFilters,
+    responseCacheKey: string,
+  ): Promise<DashboardStatsResponse> {
     const nowTimestamp = Date.now();
     const lookbackDays = Math.max(1, Math.round(lookbackHours(config.lookbackPeriod) / 24));
 
@@ -2905,7 +3537,11 @@ ${errorSummary}  Status: ${syncSummary.state}
     const filteredAlertIps = new Set<string>();
     const sliderAlertIps = new Set<string>();
 
-    for (const alert of statsIndex.alerts) {
+    for (let index = 0; index < statsIndex.alerts.length; index += 1) {
+      if (index > 0 && index % DASHBOARD_LOOP_YIELD_INTERVAL === 0) {
+        await delay(0);
+      }
+      const alert = statsIndex.alerts[index];
       if (alert.ip && alert.country && alert.country !== 'Unknown') {
         alertCountryByIp.set(alert.ip, alert.country);
       }
@@ -2934,7 +3570,12 @@ ${errorSummary}  Status: ${syncSummary.state}
     const chartDecisionAccumulator = createDashboardDecisionAccumulator();
     const sliderDecisionAccumulator = createDashboardDecisionAccumulator();
 
-    for (const decision of statsIndex.decisions) {
+    let globalTotal = 0;
+    for (let index = 0; index < statsIndex.decisions.length; index += 1) {
+      if (index > 0 && index % DASHBOARD_LOOP_YIELD_INTERVAL === 0) {
+        await delay(0);
+      }
+      const decision = statsIndex.decisions[index];
       if (!matchesDashboardSimulationFilter(decision.simulated, filters.simulation)) {
         continue;
       }
@@ -2958,8 +3599,16 @@ ${errorSummary}  Status: ${syncSummary.state}
         }
       }
     }
+    for (let index = 0; index < statsIndex.alerts.length; index += 1) {
+      if (index > 0 && index % DASHBOARD_LOOP_YIELD_INTERVAL === 0) {
+        await delay(0);
+      }
+      if (matchesDashboardSimulationFilter(statsIndex.alerts[index].simulated, filters.simulation)) {
+        globalTotal += 1;
+      }
+    }
 
-    return {
+    const response: DashboardStatsResponse = {
       totals: statsIndex.totals,
       filteredTotals: {
         alerts: filteredAlertAccumulator.alerts,
@@ -2967,7 +3616,7 @@ ${errorSummary}  Status: ${syncSummary.state}
         simulatedAlerts: filteredAlertAccumulator.simulatedAlerts,
         simulatedDecisions: filteredDecisionAccumulator.simulatedDecisions,
       },
-      globalTotal: statsIndex.alerts.filter((alert) => matchesDashboardSimulationFilter(alert.simulated, filters.simulation)).length,
+      globalTotal,
       topTargets: topDashboardEntries(filteredAlertAccumulator.targets),
       topCountries: dashboardCountryList(filteredAlertAccumulator.countries, 10),
       allCountries: dashboardWorldMapData(filteredAlertAccumulator.countries, filteredDecisionAccumulator.countries),
@@ -2986,7 +3635,44 @@ ${errorSummary}  Status: ${syncSummary.state}
         unfilteredSimulatedDecisionsHistory: dashboardBuckets(sliderDecisionAccumulator.simulatedDecisionBuckets, filters, lookbackDays, true),
       },
     };
+
+    dashboardStatsResponseCache.set(responseCacheKey, response);
+    const staleCacheKey = getStaleDashboardStatsResponseCacheKey(filters);
+    staleDashboardStatsResponseCache.set(staleCacheKey, response);
+    if (dashboardStatsResponseCache.size > 50) {
+      const firstKey = dashboardStatsResponseCache.keys().next().value;
+      if (firstKey) {
+        dashboardStatsResponseCache.delete(firstKey);
+      }
+    }
+    if (staleDashboardStatsResponseCache.size > 50) {
+      const firstKey = staleDashboardStatsResponseCache.keys().next().value;
+      if (firstKey) {
+        staleDashboardStatsResponseCache.delete(firstKey);
+      }
+    }
+
+    return response;
   }
+
+  function getDashboardStatsCacheKey(): string {
+    return `${dashboardStatsCacheVersion}:${config.lookbackMs}:${config.simulationsEnabled ? 'sim' : 'live'}`;
+  }
+
+  function invalidateDashboardStatsCache(): void {
+    dashboardStatsCache = null;
+    dashboardStatsResponseCache.clear();
+    dashboardStatsCacheVersion += 1;
+  }
+
+  function getDashboardStatsResponseCacheKey(indexKey: string, filters: DashboardStatsFilters): string {
+    return `${dashboardStatsCacheVersion}:${indexKey}:${JSON.stringify(filters)}`;
+  }
+
+  function getStaleDashboardStatsResponseCacheKey(filters: DashboardStatsFilters): string {
+    return JSON.stringify(filters);
+  }
+
   function normalizeAlertDetail(input: unknown, alertId: string): AlertRecord | null {
     if (Array.isArray(input)) {
       const matchingAlert = input.find((candidate) => String((candidate as AlertRecord | undefined)?.id) === alertId);
@@ -3015,6 +3701,8 @@ ${errorSummary}  Status: ${syncSummary.state}
     stopBackgroundTasks: () => {
       stopRefreshScheduler();
       stopHeartbeatScheduler();
+      queryWorker.close();
+      syncWorker.close();
     },
     getSyncStatus: () => ({ ...syncStatus }),
     getLapiStatus: () => lapiClient.getStatus(),
@@ -3030,6 +3718,365 @@ ${errorSummary}  Status: ${syncSummary.state}
     void ensureBootstrapReady('startup');
   }
 
+}
+
+interface SqlCondition {
+  sql: string;
+  params: unknown[];
+}
+
+class SqlWhere {
+  private readonly clauses: string[];
+  readonly params: unknown[];
+
+  constructor(clauses: string[] = [], params: unknown[] = []) {
+    this.clauses = clauses;
+    this.params = params;
+  }
+
+  add(sql: string, ...params: unknown[]): void {
+    this.clauses.push(sql);
+    this.params.push(...params);
+  }
+
+  clone(): SqlWhere {
+    return new SqlWhere([...this.clauses], [...this.params]);
+  }
+
+  toSql(): string {
+    return this.clauses.length > 0 ? `WHERE ${this.clauses.map((clause) => `(${clause})`).join(' AND ')}` : '';
+  }
+}
+
+function createSqlWhere(): SqlWhere {
+  return new SqlWhere();
+}
+
+function addLike(where: SqlWhere, columnSql: string, value: string): void {
+  where.add(`${columnSql} LIKE ?`, likeParam(value));
+}
+
+function addIpCondition(where: SqlWhere, column: string, value: string): void {
+  where.add(`(matches_ip_search_value(${column}, ?) = 1 OR LOWER(${column}) LIKE ?)`, value, likeParam(value));
+}
+
+function textCondition(columnSql: string, value: string): SqlCondition {
+  return { sql: `${columnSql} LIKE ?`, params: [likeParam(value)] };
+}
+
+function ipCondition(column: string, value: string): SqlCondition {
+  return {
+    sql: `(matches_ip_search_value(${column}, ?) = 1 OR LOWER(${column}) LIKE ?)`,
+    params: [value, likeParam(value)],
+  };
+}
+
+function freeTextSearchCondition(page: SearchPageForSql, value: string, searchIndexAvailable: boolean): SqlCondition {
+  const fallback = textCondition('LOWER(search_text)', value);
+  if (!searchIndexAvailable) {
+    return fallback;
+  }
+
+  const ftsQuery = toFtsQuery(value);
+  if (!ftsQuery) {
+    return fallback;
+  }
+
+  if (page === 'alerts') {
+    return {
+      sql: 'id IN (SELECT CAST(alert_id AS INTEGER) FROM alerts_fts WHERE alerts_fts MATCH ?)',
+      params: [ftsQuery],
+    };
+  }
+
+  return {
+    sql: 'id IN (SELECT decision_id FROM decisions_fts WHERE decisions_fts MATCH ?)',
+    params: [ftsQuery],
+  };
+}
+
+function alertFieldCondition(field: string, value: string): SqlCondition {
+  switch (field) {
+    case 'id':
+      return { sql: 'CAST(id AS TEXT) = ?', params: [value] };
+    case 'scenario':
+      return textCondition('LOWER(scenario)', value);
+    case 'message':
+      return textCondition('LOWER(message)', value);
+    case 'ip':
+      return ipCondition('source_ip', value);
+    case 'country':
+      return countryCondition(value);
+    case 'as':
+      return textCondition('LOWER(as_name)', value);
+    case 'target':
+      return textCondition('LOWER(target)', value);
+    case 'date':
+      return textCondition('LOWER(created_at)', value);
+    case 'sim':
+      return simulationTermCondition(value);
+    case 'machine':
+      return textCondition('LOWER(machine)', value);
+    case 'origin':
+      return textCondition('LOWER(origins)', value);
+    default:
+      return { sql: '0 = 1', params: [] };
+  }
+}
+
+function decisionFieldCondition(field: string, value: string, now: string, duplicateSql: string): SqlCondition {
+  switch (field) {
+    case 'id':
+      return { sql: 'CAST(id AS TEXT) = ?', params: [value] };
+    case 'alert':
+      return { sql: 'CAST(alert_id AS TEXT) = ?', params: [value] };
+    case 'scenario':
+      return textCondition('LOWER(scenario)', value);
+    case 'ip':
+      return ipCondition('value', value);
+    case 'country':
+      return countryCondition(value);
+    case 'as':
+      return textCondition('LOWER(as_name)', value);
+    case 'target':
+      return textCondition('LOWER(target)', value);
+    case 'date':
+      return textCondition('LOWER(created_at)', value);
+    case 'action':
+    case 'type':
+      return textCondition('LOWER(type)', value);
+    case 'status':
+      return decisionStatusCondition(value, now);
+    case 'duplicate':
+      return booleanCondition(value, duplicateSql);
+    case 'sim':
+      return simulationTermCondition(value);
+    case 'machine':
+      return textCondition('LOWER(machine)', value);
+    case 'origin':
+      return textCondition('LOWER(origin)', value);
+    default:
+      return { sql: '0 = 1', params: [] };
+  }
+}
+
+function countryCondition(value: string): SqlCondition {
+  const normalized = value.trim().toLowerCase();
+  if (/^[a-z]{2}$/.test(normalized)) {
+    return { sql: 'LOWER(country) = ?', params: [normalized] };
+  }
+  return {
+    sql: '(LOWER(country_name) LIKE ? OR LOWER(country) = ?)',
+    params: [likeParam(value), normalized],
+  };
+}
+
+function simulationTermCondition(value: string): SqlCondition {
+  const parsed = parseSimulationSearchValue(value);
+  if (parsed === true) {
+    return { sql: 'simulated = 1', params: [] };
+  }
+  if (parsed === false) {
+    return { sql: 'simulated = 0', params: [] };
+  }
+  return { sql: '0 = 1', params: [] };
+}
+
+function simulationComparisonCondition(operator: string, value: string): SqlCondition {
+  const parsed = parseSimulationSearchValue(value);
+  if (parsed === null) {
+    return { sql: '0 = 1', params: [] };
+  }
+  if (operator === '=') {
+    return { sql: `simulated = ${parsed ? 1 : 0}`, params: [] };
+  }
+  if (operator === '<>') {
+    return { sql: `simulated = ${parsed ? 0 : 1}`, params: [] };
+  }
+  return { sql: '0 = 1', params: [] };
+}
+
+function parseSimulationSearchValue(value: string): boolean | null {
+  const normalized = value.trim().toLowerCase();
+  if (['sim', 'simulated', 'simulation', 'true', 'yes', '1'].includes(normalized)) {
+    return true;
+  }
+  if (['live', 'false', 'no', '0'].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function decisionStatusCondition(value: string, now: string): SqlCondition {
+  const normalized = value.trim().toLowerCase();
+  if (['expired', 'inactive'].includes(normalized)) {
+    return { sql: 'stop_at <= ?', params: [now] };
+  }
+  if (['active', 'live'].includes(normalized)) {
+    return { sql: 'stop_at > ?', params: [now] };
+  }
+  return { sql: '0 = 1', params: [] };
+}
+
+function booleanCondition(value: string, trueSql: string): SqlCondition {
+  const normalized = value.trim().toLowerCase();
+  if (['true', 'yes', '1', 'on'].includes(normalized)) {
+    return { sql: trueSql, params: [] };
+  }
+  if (['false', 'no', '0', 'off'].includes(normalized)) {
+    return { sql: `NOT (${trueSql})`, params: [] };
+  }
+  return { sql: '0 = 1', params: [] };
+}
+
+function compileSearchNodeSql(
+  node: SearchNode | null,
+  context: {
+    page: SearchPageForSql;
+    dateOptions: { timezoneOffsetMinutes: number; timeZone: string | null };
+    fieldCondition: (field: string, value: string) => SqlCondition;
+    freeTextCondition: (value: string) => SqlCondition;
+  },
+  scopedField?: string,
+): SqlCondition | null {
+  if (!node) return null;
+
+  if (node.kind === 'term') {
+    return scopedField ? context.fieldCondition(scopedField, node.value) : context.freeTextCondition(node.value);
+  }
+
+  if (node.kind === 'comparison') {
+    if (node.field === 'date') {
+      return dateComparisonCondition('created_at', node.operator, node.value, context.dateOptions);
+    }
+    if (node.field === 'sim') {
+      return simulationComparisonCondition(node.operator, node.value);
+    }
+    const condition = context.fieldCondition(node.field, node.value);
+    if (node.operator === '<>') {
+      return { sql: `NOT (${condition.sql})`, params: condition.params };
+    }
+    return condition;
+  }
+
+  if (node.kind === 'field') {
+    return compileSearchNodeSql(node.expression, context, node.field);
+  }
+
+  if (node.kind === 'not') {
+    const condition = compileSearchNodeSql(node.expression, context, scopedField);
+    return condition ? { sql: `NOT (${condition.sql})`, params: condition.params } : null;
+  }
+
+  const left = compileSearchNodeSql(node.left, context, scopedField);
+  const right = compileSearchNodeSql(node.right, context, scopedField);
+  if (!left) return right;
+  if (!right) return left;
+  return {
+    sql: `(${left.sql}) ${node.operator} (${right.sql})`,
+    params: [...left.params, ...right.params],
+  };
+}
+
+type SearchPageForSql = 'alerts' | 'decisions';
+
+function dateComparisonCondition(
+  column: string,
+  operator: string,
+  value: string,
+  dateOptions: { timezoneOffsetMinutes: number; timeZone: string | null },
+): SqlCondition {
+  const range = parseSqlSearchDateValue(value, dateOptions);
+  if (!range) return { sql: '0 = 1', params: [] };
+  const start = new Date(range.start).toISOString();
+  const end = new Date(range.end).toISOString();
+
+  if (range.precision === 'day' || range.precision === 'hour') {
+    if (operator === '=') return { sql: `${column} >= ? AND ${column} < ?`, params: [start, end] };
+    if (operator === '<>') return { sql: `(${column} < ? OR ${column} >= ?)`, params: [start, end] };
+    if (operator === '<') return { sql: `${column} < ?`, params: [start] };
+    if (operator === '<=') return { sql: `${column} < ?`, params: [end] };
+    if (operator === '>') return { sql: `${column} >= ?`, params: [end] };
+    if (operator === '>=') return { sql: `${column} >= ?`, params: [start] };
+  }
+
+  if (operator === '=') return { sql: `${column} = ?`, params: [start] };
+  if (operator === '<>') return { sql: `${column} <> ?`, params: [start] };
+  if (operator === '<') return { sql: `${column} < ?`, params: [start] };
+  if (operator === '<=') return { sql: `${column} <= ?`, params: [start] };
+  if (operator === '>') return { sql: `${column} > ?`, params: [start] };
+  if (operator === '>=') return { sql: `${column} >= ?`, params: [start] };
+
+  return { sql: '0 = 1', params: [] };
+}
+
+function parseSqlSearchDateValue(
+  value: string,
+  dateOptions: { timezoneOffsetMinutes: number; timeZone: string | null },
+): { start: number; end: number; precision: 'day' | 'hour' | 'instant' } | null {
+  const trimmed = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const start = parseDashboardBucketKey(trimmed, dateOptions.timezoneOffsetMinutes, dateOptions.timeZone);
+    const endKey = formatDashboardClientBucketKey(addDashboardBucketInterval(parseDashboardWallKey(trimmed), 'day'), 'day');
+    const end = parseDashboardBucketKey(endKey, dateOptions.timezoneOffsetMinutes, dateOptions.timeZone);
+    return { start: start.getTime(), end: end.getTime(), precision: 'day' };
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(trimmed)) {
+    const start = parseDashboardBucketKey(trimmed, dateOptions.timezoneOffsetMinutes, dateOptions.timeZone);
+    const endKey = formatDashboardClientBucketKey(addDashboardBucketInterval(parseDashboardWallKey(trimmed), 'hour'), 'hour');
+    const end = parseDashboardBucketKey(endKey, dateOptions.timezoneOffsetMinutes, dateOptions.timeZone);
+    return { start: start.getTime(), end: end.getTime(), precision: 'hour' };
+  }
+
+  const timestamp = Date.parse(trimmed);
+  if (!Number.isFinite(timestamp)) return null;
+  return { start: timestamp, end: timestamp, precision: 'instant' };
+}
+
+function getDateFilterBoundary(
+  value: string,
+  timezoneOffsetMinutes: number,
+  timeZone: string | null,
+  includeHour: boolean,
+): Date {
+  if ((includeHour && /^\d{4}-\d{2}-\d{2}T\d{2}$/.test(value)) || (!includeHour && /^\d{4}-\d{2}-\d{2}$/.test(value))) {
+    return parseDashboardBucketKey(value, timezoneOffsetMinutes, timeZone);
+  }
+  const timestamp = Date.parse(value);
+  return new Date(Number.isFinite(timestamp) ? timestamp : 0);
+}
+
+function getDecisionDuplicateSql(now: string): string {
+  const nowLiteral = quoteSqlLiteral(now);
+  return `(
+    decisions.stop_at > ${nowLiteral}
+    AND decisions.is_duplicate = 1
+  )`;
+}
+
+function quoteSqlLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function likeParam(value: string): string {
+  return `%${escapeLike(value.trim().toLowerCase())}%`;
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
+function toFtsQuery(value: string): string | null {
+  const terms = value
+    .trim()
+    .toLowerCase()
+    .split(/[^a-z0-9_./:-]+/i)
+    .map((term) => term.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  if (terms.length === 0) return null;
+  return terms.map((term) => `"${term.replace(/"/g, '""')}"`).join(' AND ');
 }
 
 function loadMetricsSidebarVisible(database: CrowdsecDatabase): boolean {
@@ -3301,38 +4348,46 @@ function toPaginatedResponse<T>(
 }
 
 function getAlertListFilters(context: HonoContext, timeZone: string | null): AlertListFilters {
+  return getAlertListFiltersFromValues((key) => context.req.query(key), timeZone);
+}
+
+function getAlertListFiltersFromValues(readValue: (key: string) => string | undefined, timeZone: string | null): AlertListFilters {
   return {
-    q: context.req.query('q') || '',
-    ip: lowerQuery(context, 'ip'),
-    country: lowerQuery(context, 'country'),
-    scenario: lowerQuery(context, 'scenario'),
-    as: lowerQuery(context, 'as'),
-    date: context.req.query('date') || '',
-    dateStart: context.req.query('dateStart') || '',
-    dateEnd: context.req.query('dateEnd') || '',
-    target: lowerQuery(context, 'target'),
-    simulation: context.req.query('simulation') || 'all',
-    timezoneOffsetMinutes: parseTimezoneOffset(context),
-    timeZone: getEffectiveRequestTimeZone(context, timeZone),
+    q: readValue('q') || '',
+    ip: lowerValue(readValue('ip')),
+    country: lowerValue(readValue('country')),
+    scenario: lowerValue(readValue('scenario')),
+    as: lowerValue(readValue('as')),
+    date: readValue('date') || '',
+    dateStart: readValue('dateStart') || '',
+    dateEnd: readValue('dateEnd') || '',
+    target: lowerValue(readValue('target')),
+    simulation: readValue('simulation') || 'all',
+    timezoneOffsetMinutes: parseTimezoneOffsetValue(readValue('tz_offset')),
+    timeZone: getEffectiveRequestTimeZoneValue(readValue('browser_tz'), timeZone),
   };
 }
 
 function getDecisionListFilters(context: HonoContext, timeZone: string | null): DecisionListFilters {
-  const alertId = context.req.query('alert_id') || '';
+  return getDecisionListFiltersFromValues((key) => context.req.query(key), timeZone);
+}
+
+function getDecisionListFiltersFromValues(readValue: (key: string) => string | undefined, timeZone: string | null): DecisionListFilters {
+  const alertId = readValue('alert_id') || '';
   return {
-    q: context.req.query('q') || '',
+    q: readValue('q') || '',
     alertId,
-    country: context.req.query('country') || '',
-    scenario: context.req.query('scenario') || '',
-    as: context.req.query('as') || '',
-    ip: context.req.query('ip') || '',
-    target: lowerQuery(context, 'target'),
-    dateStart: context.req.query('dateStart') || '',
-    dateEnd: context.req.query('dateEnd') || '',
-    simulation: context.req.query('simulation') || 'all',
-    showDuplicates: context.req.query('hide_duplicates') === 'false' || Boolean(alertId),
-    timezoneOffsetMinutes: parseTimezoneOffset(context),
-    timeZone: getEffectiveRequestTimeZone(context, timeZone),
+    country: readValue('country') || '',
+    scenario: readValue('scenario') || '',
+    as: readValue('as') || '',
+    ip: readValue('ip') || '',
+    target: lowerValue(readValue('target')),
+    dateStart: readValue('dateStart') || '',
+    dateEnd: readValue('dateEnd') || '',
+    simulation: readValue('simulation') || 'all',
+    showDuplicates: readValue('hide_duplicates') === 'false' || Boolean(alertId),
+    timezoneOffsetMinutes: parseTimezoneOffsetValue(readValue('tz_offset')),
+    timeZone: getEffectiveRequestTimeZoneValue(readValue('browser_tz'), timeZone),
   };
 }
 
@@ -3700,7 +4755,11 @@ function getDashboardBucketFullDate(key: string, timezoneOffsetMinutes: number, 
   return parseDashboardBucketKey(key, timezoneOffsetMinutes, timeZone).toISOString();
 }
 function lowerQuery(context: HonoContext, key: string): string {
-  return (context.req.query(key) || '').toLowerCase();
+  return lowerValue(context.req.query(key));
+}
+
+function lowerValue(value: string | undefined): string {
+  return (value || '').toLowerCase();
 }
 
 function toSearchErrorResponse(error: SearchParseError): { error: string; details: SearchParseError } {
@@ -3711,12 +4770,20 @@ function toSearchErrorResponse(error: SearchParseError): { error: string; detail
 }
 
 function parseTimezoneOffset(context: HonoContext): number {
-  const value = Number.parseInt(context.req.query('tz_offset') || '0', 10);
+  return parseTimezoneOffsetValue(context.req.query('tz_offset'));
+}
+
+function parseTimezoneOffsetValue(rawValue: string | undefined): number {
+  const value = Number.parseInt(rawValue || '0', 10);
   return Number.isFinite(value) ? value : 0;
 }
 
 function getEffectiveRequestTimeZone(context: HonoContext, configuredTimeZone: string | null): string | null {
-  return configuredTimeZone || sanitizeRequestTimeZone(context.req.query('browser_tz'));
+  return getEffectiveRequestTimeZoneValue(context.req.query('browser_tz'), configuredTimeZone);
+}
+
+function getEffectiveRequestTimeZoneValue(browserTimeZone: string | undefined, configuredTimeZone: string | null): string | null {
+  return configuredTimeZone || sanitizeRequestTimeZone(browserTimeZone);
 }
 
 function sanitizeRequestTimeZone(value: string | undefined): string | null {

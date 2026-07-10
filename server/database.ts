@@ -1,7 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import BetterSqlite3 from 'better-sqlite3';
+import type { AlertDecision, AlertRecord } from '../shared/contracts';
+import { matchesIpSearchValue } from '../shared/search';
+import { deriveAlertIndexValues, deriveAlertIndexValuesFromRecord, deriveDecisionIndexValues, deriveDecisionIndexValuesFromRecord } from './record-index';
 
 type SqliteStatement = {
   run: (...params: any[]) => { changes: number };
@@ -15,6 +19,7 @@ type Database = {
   prepare: (sql: string) => SqliteStatement;
   transaction: <T extends (...args: any[]) => any>(callback: T) => T;
   query: (sql: string) => SqliteStatement;
+  function?: (name: string, optionsOrFn: unknown, fn?: (...args: unknown[]) => unknown) => void;
 };
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -27,6 +32,7 @@ export interface AlertInsertParams {
   $source_ip?: string;
   $message: string;
   $raw_data: string;
+  $record?: AlertRecord;
 }
 
 export interface DecisionInsertParams {
@@ -40,6 +46,7 @@ export interface DecisionInsertParams {
   $origin?: string;
   $scenario?: string;
   $raw_data: string;
+  $record?: AlertDecision & Record<string, unknown>;
 }
 
 export interface DecisionUpdateParams {
@@ -93,6 +100,9 @@ export interface AuthUserRow {
   totp_last_step: number | null;
   role: 'admin' | 'read-only';
   auth_provider: 'password' | 'oidc';
+  oidc_issuer: string | null;
+  oidc_subject: string | null;
+  session_version: number;
   created_at: string;
   updated_at: string;
 }
@@ -110,6 +120,10 @@ export interface WebAuthnCredentialRow {
 
 export class CrowdsecDatabase {
   public readonly db: Database;
+  public readonly dbPath: string;
+  public readonly searchIndexAvailable: boolean;
+  private searchIndexUpdatesDeferred = false;
+  private decisionDuplicateFlagsDirty = true;
 
   private readonly insertAlertStatement: any;
   private readonly getAllAlertsStatement: any;
@@ -118,14 +132,12 @@ export class CrowdsecDatabase {
   private readonly getAlertIdsBetweenStatement: any;
   private readonly countAlertsStatement: any;
   private readonly countDecisionsStatement: any;
-  private readonly deleteOldAlertsStatement: any;
   private readonly insertDecisionStatement: any;
   private readonly updateDecisionStatement: any;
   private readonly getAllDecisionsStatement: any;
   private readonly getActiveDecisionsStatement: any;
   private readonly getActiveAlertIdsStatement: any;
   private readonly getDecisionsSinceStatement: any;
-  private readonly deleteOldDecisionsStatement: any;
   private readonly deleteDecisionStatement: any;
   private readonly getDecisionByIdStatement: any;
   private readonly getDecisionIdsByAlertIdStatement: any;
@@ -138,10 +150,12 @@ export class CrowdsecDatabase {
   private readonly createAuthUserStatement: any;
   private readonly getAuthUserByIdStatement: any;
   private readonly getAuthUserByUsernameStatement: any;
+  private readonly getAuthUserByOidcIdentityStatement: any;
   private readonly updateAuthUserPasswordStatement: any;
   private readonly updateAuthUserTotpStatement: any;
   private readonly updateAuthUserTotpLastStepStatement: any;
-  private readonly upsertOidcUserStatement: any;
+  private readonly createOidcUserStatement: any;
+  private readonly updateOidcUserStatement: any;
   private readonly listWebAuthnCredentialsByUserStatement: any;
   private readonly countWebAuthnCredentialsStatement: any;
   private readonly createWebAuthnCredentialStatement: any;
@@ -172,16 +186,58 @@ export class CrowdsecDatabase {
   private readonly countUnreadNotificationsStatement: any;
   private readonly getCveCacheEntryStatement: any;
   private readonly upsertCveCacheEntryStatement: any;
+  private readonly deleteAlertSearchIndexStatement: any | null;
+  private readonly insertAlertSearchIndexStatement: any | null;
+  private readonly deleteDecisionSearchIndexStatement: any | null;
+  private readonly insertDecisionSearchIndexStatement: any | null;
 
   constructor(options: DatabaseOptions = {}) {
     const resolvedPath = resolveDatabasePath(options);
+    this.dbPath = resolvedPath;
     this.db = openDatabase(resolvedPath);
     const freshDatabase = isDatabaseFresh(this.db);
-    initSchema(this.db, freshDatabase);
+    this.searchIndexAvailable = initSchema(this.db, freshDatabase);
 
     this.insertAlertStatement = this.db.query(`
-      INSERT OR REPLACE INTO alerts (id, uuid, created_at, scenario, source_ip, message, raw_data)
-      VALUES ($id, $uuid, $created_at, $scenario, $source_ip, $message, $raw_data)
+      INSERT INTO alerts (
+        id, uuid, created_at, scenario, source_ip, message, raw_data,
+        country, country_name, as_name, target, machine, meta_search, origins, simulated, search_text
+      )
+      VALUES (
+        $id, $uuid, $created_at, $scenario, $source_ip, $message, $raw_data,
+        $country, $country_name, $as_name, $target, $machine, $meta_search, $origins, $simulated, $search_text
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        uuid = excluded.uuid,
+        created_at = excluded.created_at,
+        scenario = excluded.scenario,
+        source_ip = excluded.source_ip,
+        message = excluded.message,
+        raw_data = excluded.raw_data,
+        country = excluded.country,
+        country_name = excluded.country_name,
+        as_name = excluded.as_name,
+        target = excluded.target,
+        machine = excluded.machine,
+        meta_search = excluded.meta_search,
+        origins = excluded.origins,
+        simulated = excluded.simulated,
+        search_text = excluded.search_text
+      WHERE alerts.uuid IS NOT excluded.uuid
+        OR alerts.created_at IS NOT excluded.created_at
+        OR alerts.scenario IS NOT excluded.scenario
+        OR alerts.source_ip IS NOT excluded.source_ip
+        OR alerts.message IS NOT excluded.message
+        OR alerts.raw_data IS NOT excluded.raw_data
+        OR alerts.country IS NOT excluded.country
+        OR alerts.country_name IS NOT excluded.country_name
+        OR alerts.as_name IS NOT excluded.as_name
+        OR alerts.target IS NOT excluded.target
+        OR alerts.machine IS NOT excluded.machine
+        OR alerts.meta_search IS NOT excluded.meta_search
+        OR alerts.origins IS NOT excluded.origins
+        OR alerts.simulated IS NOT excluded.simulated
+        OR alerts.search_text IS NOT excluded.search_text
     `);
 
     this.getAllAlertsStatement = this.db.query(`
@@ -205,15 +261,63 @@ export class CrowdsecDatabase {
 
     this.countAlertsStatement = this.db.query('SELECT COUNT(*) as count FROM alerts');
     this.countDecisionsStatement = this.db.query('SELECT COUNT(*) as count FROM decisions');
-    this.deleteOldAlertsStatement = this.db.query('DELETE FROM alerts WHERE created_at < $cutoff');
 
     this.insertDecisionStatement = this.db.query(`
-      INSERT OR REPLACE INTO decisions (id, uuid, alert_id, created_at, stop_at, value, type, origin, scenario, raw_data)
-      VALUES ($id, $uuid, $alert_id, $created_at, $stop_at, $value, $type, $origin, $scenario, $raw_data)
+      INSERT INTO decisions (
+        id, uuid, alert_id, created_at, stop_at, value, type, origin, scenario, raw_data,
+        country, country_name, as_name, target, machine, simulated, search_text, is_duplicate
+      )
+      VALUES (
+        $id, $uuid, $alert_id, $created_at, $stop_at, $value, $type, $origin, $scenario, $raw_data,
+        $country, $country_name, $as_name, $target, $machine, $simulated, $search_text, 0
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        uuid = excluded.uuid,
+        alert_id = excluded.alert_id,
+        created_at = excluded.created_at,
+        stop_at = excluded.stop_at,
+        value = excluded.value,
+        type = excluded.type,
+        origin = excluded.origin,
+        scenario = excluded.scenario,
+        raw_data = excluded.raw_data,
+        country = excluded.country,
+        country_name = excluded.country_name,
+        as_name = excluded.as_name,
+        target = excluded.target,
+        machine = excluded.machine,
+        simulated = excluded.simulated,
+        search_text = excluded.search_text,
+        is_duplicate = 0
+      WHERE decisions.uuid IS NOT excluded.uuid
+        OR decisions.alert_id IS NOT excluded.alert_id
+        OR decisions.created_at IS NOT excluded.created_at
+        OR decisions.stop_at IS NOT excluded.stop_at
+        OR decisions.value IS NOT excluded.value
+        OR decisions.type IS NOT excluded.type
+        OR decisions.origin IS NOT excluded.origin
+        OR decisions.scenario IS NOT excluded.scenario
+        OR decisions.raw_data IS NOT excluded.raw_data
+        OR decisions.country IS NOT excluded.country
+        OR decisions.country_name IS NOT excluded.country_name
+        OR decisions.as_name IS NOT excluded.as_name
+        OR decisions.target IS NOT excluded.target
+        OR decisions.machine IS NOT excluded.machine
+        OR decisions.simulated IS NOT excluded.simulated
+        OR decisions.search_text IS NOT excluded.search_text
     `);
 
     this.updateDecisionStatement = this.db.query(`
-      UPDATE decisions SET stop_at = $stop_at, raw_data = $raw_data
+      UPDATE decisions SET
+        stop_at = $stop_at,
+        raw_data = $raw_data,
+        country = $country,
+        country_name = $country_name,
+        as_name = $as_name,
+        target = $target,
+        machine = $machine,
+        simulated = $simulated,
+        search_text = $search_text
       WHERE id = $id
     `);
 
@@ -227,12 +331,16 @@ export class CrowdsecDatabase {
       ORDER BY stop_at DESC
     `);
     this.getActiveAlertIdsStatement = this.db.query(`
-      SELECT DISTINCT decisions.alert_id AS id
-      FROM decisions
-      INNER JOIN alerts ON alerts.id = decisions.alert_id
-      WHERE decisions.stop_at > $now
-        AND decisions.alert_id IS NOT NULL
-        AND alerts.created_at >= $since
+      SELECT DISTINCT active.alert_id AS id
+      FROM decisions AS active INDEXED BY idx_decisions_stop_alert_id
+      WHERE active.stop_at > $now
+        AND active.alert_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM alerts
+          WHERE alerts.id = active.alert_id
+            AND alerts.created_at >= $since
+        )
     `);
 
     this.getDecisionsSinceStatement = this.db.query(`
@@ -241,7 +349,6 @@ export class CrowdsecDatabase {
       ORDER BY stop_at DESC
     `);
 
-    this.deleteOldDecisionsStatement = this.db.query('DELETE FROM decisions WHERE stop_at < $cutoff');
     this.deleteDecisionStatement = this.db.query('DELETE FROM decisions WHERE id = $id');
     this.getDecisionByIdStatement = this.db.query('SELECT raw_data, stop_at FROM decisions WHERE id = $id');
     this.getDecisionIdsByAlertIdStatement = this.db.query('SELECT id FROM decisions WHERE alert_id = $alert_id');
@@ -262,9 +369,15 @@ export class CrowdsecDatabase {
     `);
     this.getAuthUserByIdStatement = this.db.query('SELECT * FROM auth_users WHERE id = $id');
     this.getAuthUserByUsernameStatement = this.db.query('SELECT * FROM auth_users WHERE username = $username');
+    this.getAuthUserByOidcIdentityStatement = this.db.query(`
+      SELECT * FROM auth_users
+      WHERE oidc_issuer = $oidc_issuer AND oidc_subject = $oidc_subject
+    `);
     this.updateAuthUserPasswordStatement = this.db.query(`
       UPDATE auth_users
-      SET password_hash = $password_hash, updated_at = $updated_at
+      SET password_hash = $password_hash,
+          session_version = session_version + 1,
+          updated_at = $updated_at
       WHERE id = $id
     `);
     this.updateAuthUserTotpStatement = this.db.query(`
@@ -277,20 +390,34 @@ export class CrowdsecDatabase {
       SET totp_last_step = $totp_last_step, updated_at = $updated_at
       WHERE id = $id AND (totp_last_step IS NULL OR totp_last_step < $totp_last_step)
     `);
-    this.upsertOidcUserStatement = this.db.query(`
-      INSERT INTO auth_users (username, password_hash, role, auth_provider, created_at, updated_at)
-      VALUES ($username, NULL, $role, 'oidc', $created_at, $updated_at)
-      ON CONFLICT(username) DO UPDATE SET
-        role = excluded.role,
-        auth_provider = 'oidc',
-        updated_at = excluded.updated_at
+    this.createOidcUserStatement = this.db.query(`
+      INSERT INTO auth_users (
+        username, password_hash, role, auth_provider, oidc_issuer, oidc_subject, created_at, updated_at
+      )
+      VALUES ($username, NULL, $role, 'oidc', $oidc_issuer, $oidc_subject, $created_at, $updated_at)
+    `);
+    this.updateOidcUserStatement = this.db.query(`
+      UPDATE auth_users
+      SET username = $username,
+          role = $role,
+          auth_provider = 'oidc',
+          oidc_issuer = $oidc_issuer,
+          oidc_subject = $oidc_subject,
+          session_version = CASE WHEN role IS NOT $role THEN session_version + 1 ELSE session_version END,
+          updated_at = $updated_at
+      WHERE id = $id
     `);
     this.listWebAuthnCredentialsByUserStatement = this.db.query(`
       SELECT * FROM webauthn_credentials
       WHERE user_id = $user_id
       ORDER BY created_at DESC
     `);
-    this.countWebAuthnCredentialsStatement = this.db.query('SELECT COUNT(*) as count FROM webauthn_credentials');
+    this.countWebAuthnCredentialsStatement = this.db.query(`
+      SELECT COUNT(*) as count
+      FROM webauthn_credentials credentials
+      JOIN auth_users users ON users.id = credentials.user_id
+      WHERE users.auth_provider <> 'oidc' OR users.password_hash IS NOT NULL
+    `);
     this.createWebAuthnCredentialStatement = this.db.query(`
       INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, name, created_at)
       VALUES ($user_id, $credential_id, $public_key, $sign_count, $transports, $name, $created_at)
@@ -393,6 +520,18 @@ export class CrowdsecDatabase {
       INSERT OR REPLACE INTO cve_cache (id, published_at, fetched_at)
       VALUES ($id, $published_at, $fetched_at)
     `);
+    this.deleteAlertSearchIndexStatement = this.searchIndexAvailable
+      ? this.db.prepare('DELETE FROM alerts_fts WHERE alert_id = ?')
+      : null;
+    this.insertAlertSearchIndexStatement = this.searchIndexAvailable
+      ? this.db.prepare('INSERT INTO alerts_fts(rowid, alert_id, search_text) VALUES (?, ?, ?)')
+      : null;
+    this.deleteDecisionSearchIndexStatement = this.searchIndexAvailable
+      ? this.db.prepare('DELETE FROM decisions_fts WHERE decision_id = ?')
+      : null;
+    this.insertDecisionSearchIndexStatement = this.searchIndexAvailable
+      ? this.db.prepare('INSERT INTO decisions_fts(decision_id, search_text) VALUES (?, ?)')
+      : null;
   }
 
   close(): void {
@@ -406,10 +545,67 @@ export class CrowdsecDatabase {
   clearSyncData(): void {
     this.db.exec('DELETE FROM alerts');
     this.db.exec('DELETE FROM decisions');
+    this.decisionDuplicateFlagsDirty = true;
+    this.clearSearchIndexes();
   }
 
-  insertAlert(params: AlertInsertParams): void {
-    this.insertAlertStatement.run(params);
+  beginDeferredSearchIndexUpdates(): void {
+    if (!this.searchIndexAvailable) return;
+    this.searchIndexUpdatesDeferred = true;
+    this.clearSearchIndexes();
+  }
+
+  rebuildSearchIndexes(): void {
+    if (!this.searchIndexAvailable) return;
+    try {
+      this.clearSearchIndexes();
+      backfillSearchIndexes(this.db);
+    } finally {
+      this.searchIndexUpdatesDeferred = false;
+    }
+  }
+
+  async rebuildSearchIndexesCooperative(yieldControl: () => Promise<void>, batchSize = 1_000): Promise<void> {
+    if (!this.searchIndexAvailable) return;
+    try {
+      this.clearSearchIndexes();
+      await backfillSearchIndexesCooperative(this.db, yieldControl, batchSize);
+    } finally {
+      this.searchIndexUpdatesDeferred = false;
+    }
+  }
+
+  insertAlert(params: AlertInsertParams): boolean {
+    const fallback = {
+      createdAt: params.$created_at,
+      scenario: params.$scenario,
+      sourceIp: params.$source_ip,
+      message: params.$message,
+    };
+    const index = params.$record
+      ? deriveAlertIndexValuesFromRecord(params.$record, fallback)
+      : deriveAlertIndexValues(params.$raw_data, fallback);
+    const { $record, ...dbParams } = params;
+    const result = this.insertAlertStatement.run({
+      ...dbParams,
+      $created_at: index.historyAt,
+      $scenario: index.scenario ?? params.$scenario,
+      $source_ip: index.sourceIp ?? params.$source_ip,
+      $country: index.country,
+      $country_name: index.countryName,
+      $as_name: index.asName,
+      $target: index.target,
+      $machine: index.machine,
+      $meta_search: index.metaSearch,
+      $origins: index.origins,
+      $simulated: index.simulated,
+      $search_text: index.searchText,
+    });
+    if (result.changes > 0) {
+      this.upsertAlertSearchIndex(params.$id, index.searchText);
+      return true;
+    }
+    return false;
   }
 
   getAllAlerts(): RowWithRawData[] {
@@ -431,8 +627,11 @@ export class CrowdsecDatabase {
       .map((row) => String(row.id))
       .filter((id) => !keepSet.has(id));
 
+    this.deleteDecisionSearchIndexesByAlertIds(staleIds);
     const decisions = runChunkedIdMutation(this.db, 'DELETE FROM decisions WHERE alert_id IN', staleIds);
     const alerts = runChunkedIdMutation(this.db, 'DELETE FROM alerts WHERE id IN', staleIds);
+    if (decisions > 0) this.decisionDuplicateFlagsDirty = true;
+    this.deleteAlertSearchIndexes(staleIds);
     return { alerts, decisions };
   }
 
@@ -445,15 +644,75 @@ export class CrowdsecDatabase {
   }
 
   deleteOldAlerts(cutoff: string): number {
-    return this.deleteOldAlertsStatement.run({ $cutoff: cutoff }).changes;
+    let changes = 0;
+    const selectOldAlerts = this.db.prepare('SELECT id FROM alerts WHERE created_at < ? LIMIT 900');
+    while (true) {
+      const ids = (selectOldAlerts.all(cutoff) as IdRow[]).map((row) => String(row.id));
+      if (ids.length === 0) break;
+      changes += runChunkedIdMutation(this.db, 'DELETE FROM alerts WHERE id IN', ids);
+      this.deleteAlertSearchIndexes(ids);
+    }
+    return changes;
   }
 
-  insertDecision(params: DecisionInsertParams): void {
-    this.insertDecisionStatement.run(params);
+  insertDecision(params: DecisionInsertParams): boolean {
+    const fallback = {
+      value: params.$value,
+      type: params.$type,
+      origin: params.$origin,
+      scenario: params.$scenario,
+    };
+    const index = params.$record
+      ? deriveDecisionIndexValuesFromRecord(params.$record, fallback)
+      : deriveDecisionIndexValues(params.$raw_data, fallback);
+    const { $record, ...dbParams } = params;
+    const result = this.insertDecisionStatement.run({
+      ...dbParams,
+      $country: index.country,
+      $country_name: index.countryName,
+      $as_name: index.asName,
+      $target: index.target,
+      $machine: index.machine,
+      $simulated: index.simulated,
+      $search_text: index.searchText,
+    });
+    if (result.changes > 0) {
+      this.decisionDuplicateFlagsDirty = true;
+      this.upsertDecisionSearchIndex(params.$id, index.searchText);
+      return true;
+    }
+    return false;
   }
 
   updateDecision(params: DecisionUpdateParams): void {
-    this.updateDecisionStatement.run(params);
+    const existing = this.getDecisionById(params.$id);
+    let fallback: { value?: string | null; type?: string | null; origin?: string | null; scenario?: string | null } = {};
+    if (existing?.raw_data) {
+      try {
+        const parsed = JSON.parse(existing.raw_data) as Record<string, unknown>;
+        fallback = {
+          value: typeof parsed.value === 'string' ? parsed.value : null,
+          type: typeof parsed.type === 'string' ? parsed.type : null,
+          origin: typeof parsed.origin === 'string' ? parsed.origin : null,
+          scenario: typeof parsed.scenario === 'string' ? parsed.scenario : null,
+        };
+      } catch {
+        fallback = {};
+      }
+    }
+    const index = deriveDecisionIndexValues(params.$raw_data, fallback);
+    this.updateDecisionStatement.run({
+      ...params,
+      $country: index.country,
+      $country_name: index.countryName,
+      $as_name: index.asName,
+      $target: index.target,
+      $machine: index.machine,
+      $simulated: index.simulated,
+      $search_text: index.searchText,
+    });
+    this.decisionDuplicateFlagsDirty = true;
+    this.upsertDecisionSearchIndex(params.$id, index.searchText);
   }
 
   getAllDecisions(): RowWithRawData[] {
@@ -471,8 +730,11 @@ export class CrowdsecDatabase {
       .map((row) => String(row.id))
       .filter((id) => !keepSet.has(id));
 
+    this.deleteDecisionSearchIndexesByAlertIds(staleIds);
     const decisions = runChunkedIdMutation(this.db, 'DELETE FROM decisions WHERE alert_id IN', staleIds);
     const alerts = runChunkedIdMutation(this.db, 'DELETE FROM alerts WHERE id IN', staleIds);
+    if (decisions > 0) this.decisionDuplicateFlagsDirty = true;
+    this.deleteAlertSearchIndexes(staleIds);
     return { alerts, decisions };
   }
 
@@ -481,22 +743,40 @@ export class CrowdsecDatabase {
   }
 
   deleteOldDecisions(cutoff: string): number {
-    return this.deleteOldDecisionsStatement.run({ $cutoff: cutoff }).changes;
+    let changes = 0;
+    const selectOldDecisions = this.db.prepare('SELECT id FROM decisions WHERE stop_at < ? LIMIT 900');
+    while (true) {
+      const ids = (selectOldDecisions.all(cutoff) as IdRow[]).map((row) => String(row.id));
+      if (ids.length === 0) break;
+      changes += runChunkedIdMutation(this.db, 'DELETE FROM decisions WHERE id IN', ids);
+      this.deleteDecisionSearchIndexes(ids);
+    }
+    if (changes > 0) this.decisionDuplicateFlagsDirty = true;
+    return changes;
   }
 
   deleteDecision(id: string | number): void {
     this.deleteDecisionStatement.run({ $id: String(id) });
+    this.decisionDuplicateFlagsDirty = true;
+    this.deleteDecisionSearchIndex(id);
   }
 
   deleteCachedAlerts(ids: Array<string | number>): { alerts: number; decisions: number } {
     const normalizedIds = ids.map(String);
+    this.deleteDecisionSearchIndexesByAlertIds(normalizedIds);
     const decisions = runChunkedIdMutation(this.db, 'DELETE FROM decisions WHERE alert_id IN', normalizedIds);
     const alerts = runChunkedIdMutation(this.db, 'DELETE FROM alerts WHERE id IN', normalizedIds);
+    if (decisions > 0) this.decisionDuplicateFlagsDirty = true;
+    this.deleteAlertSearchIndexes(normalizedIds);
     return { alerts, decisions };
   }
 
   deleteCachedDecisions(ids: Array<string | number>): number {
-    return runChunkedIdMutation(this.db, 'DELETE FROM decisions WHERE id IN', ids.map(String));
+    const normalizedIds = ids.map(String);
+    const changes = runChunkedIdMutation(this.db, 'DELETE FROM decisions WHERE id IN', normalizedIds);
+    if (changes > 0) this.decisionDuplicateFlagsDirty = true;
+    this.deleteDecisionSearchIndexes(normalizedIds);
+    return changes;
   }
 
   getDecisionById(id: string | number): { raw_data: string; stop_at: string } | null {
@@ -521,8 +801,10 @@ export class CrowdsecDatabase {
       const placeholders = chunk.map(() => '?').join(',');
       const statement = this.db.prepare(`DELETE FROM decisions WHERE id IN (${placeholders})`);
       changes += statement.run(...chunk).changes;
+      this.deleteDecisionSearchIndexes(chunk);
     }
 
+    if (changes > 0) this.decisionDuplicateFlagsDirty = true;
     return changes;
   }
 
@@ -550,10 +832,45 @@ export class CrowdsecDatabase {
 
   deleteAlert(id: string | number): void {
     this.deleteAlertStatement.run({ $id: id });
+    this.deleteAlertSearchIndex(id);
   }
 
   deleteDecisionsByAlertId(alertId: string | number): void {
-    this.deleteDecisionsByAlertIdStatement.run({ $alert_id: alertId });
+    this.deleteDecisionSearchIndexesByAlertIds([String(alertId)]);
+    const result = this.deleteDecisionsByAlertIdStatement.run({ $alert_id: alertId });
+    if (result.changes > 0) this.decisionDuplicateFlagsDirty = true;
+  }
+
+  refreshDecisionDuplicateFlags(now: string, force = false): void {
+    if (!force && !this.decisionDuplicateFlagsDirty) return;
+
+    const refresh = this.db.transaction((timestamp: string) => {
+      this.db.prepare('UPDATE decisions SET is_duplicate = 0 WHERE is_duplicate <> 0').run();
+      this.db.prepare(`
+        WITH ranked AS (
+          SELECT
+            id,
+            ROW_NUMBER() OVER (
+              PARTITION BY COALESCE(value, ''), simulated
+              ORDER BY
+                stop_at DESC,
+                CASE WHEN id GLOB '[0-9]*' THEN CAST(id AS INTEGER) ELSE 9223372036854775807 END ASC
+            ) AS duplicate_rank
+          FROM decisions
+          WHERE stop_at > ?
+        )
+        UPDATE decisions
+        SET is_duplicate = 1
+        WHERE id IN (
+          SELECT id
+          FROM ranked
+          WHERE duplicate_rank > 1
+        )
+      `).run(timestamp);
+    });
+
+    refresh(now);
+    this.decisionDuplicateFlagsDirty = false;
   }
 
   getMeta(key: string): MetaRow | null {
@@ -624,15 +941,59 @@ export class CrowdsecDatabase {
     }).changes > 0;
   }
 
-  upsertOidcUser(username: string, role: 'admin' | 'read-only'): AuthUserRow {
+  upsertOidcUser(params: {
+    username: string;
+    role: 'admin' | 'read-only';
+    issuer: string;
+    subject: string;
+  }): AuthUserRow {
     const now = new Date().toISOString();
-    this.upsertOidcUserStatement.run({
-      $username: username,
-      $role: role,
-      $created_at: now,
+    let user = this.getAuthUserByOidcIdentityStatement.get({
+      $oidc_issuer: params.issuer,
+      $oidc_subject: params.subject,
+    }) as AuthUserRow | null;
+
+    // Claim a pre-migration OIDC row on its first login. Never claim a row that
+    // still has a local password, because older releases could merge an OIDC
+    // identity into a local account when their usernames matched.
+    if (!user) {
+      const legacy = this.getAuthUserByUsername(params.username);
+      if (legacy?.auth_provider === 'oidc' && !legacy.oidc_subject && !legacy.password_hash) {
+        user = legacy;
+      }
+    }
+
+    const usernameOwner = this.getAuthUserByUsername(params.username);
+    const identitySuffix = crypto
+      .createHash('sha256')
+      .update(`${params.issuer}\n${params.subject}`, 'utf8')
+      .digest('hex')
+      .slice(0, 10);
+    const storedUsername = !usernameOwner || usernameOwner.id === user?.id
+      ? params.username
+      : `${params.username}#oidc-${identitySuffix}`;
+
+    if (!user) {
+      const result = this.createOidcUserStatement.run({
+        $username: storedUsername,
+        $role: params.role,
+        $oidc_issuer: params.issuer,
+        $oidc_subject: params.subject,
+        $created_at: now,
+        $updated_at: now,
+      }) as { lastInsertRowid?: number | bigint };
+      return this.getAuthUserById(Number(result.lastInsertRowid))!;
+    }
+
+    this.updateOidcUserStatement.run({
+      $id: user.id,
+      $username: storedUsername,
+      $role: params.role,
+      $oidc_issuer: params.issuer,
+      $oidc_subject: params.subject,
       $updated_at: now,
     });
-    return this.getAuthUserByUsername(username)!;
+    return this.getAuthUserById(user.id)!;
   }
 
   listWebAuthnCredentialsByUser(userId: number): WebAuthnCredentialRow[] {
@@ -839,6 +1200,90 @@ export class CrowdsecDatabase {
   transaction<T>(callback: (value: T) => void): (value: T) => void {
     return this.db.transaction(callback);
   }
+
+  private clearSearchIndexes(): void {
+    if (!this.searchIndexAvailable) return;
+    this.runSearchIndexStatement('DELETE FROM alerts_fts');
+    this.runSearchIndexStatement('DELETE FROM decisions_fts');
+  }
+
+  private upsertAlertSearchIndex(id: string | number, searchText: string): void {
+    if (this.searchIndexUpdatesDeferred) return;
+    if (!this.searchIndexAvailable || !this.deleteAlertSearchIndexStatement || !this.insertAlertSearchIndexStatement) return;
+    const numericId = Number(id);
+    if (!Number.isSafeInteger(numericId) || numericId < 1) return;
+    try {
+      this.deleteAlertSearchIndexStatement.run(String(id));
+      this.insertAlertSearchIndexStatement.run(numericId, String(id), searchText);
+    } catch {
+      // Search indexing is an optimization; core table data remains authoritative.
+    }
+  }
+
+  private upsertDecisionSearchIndex(id: string | number, searchText: string): void {
+    if (this.searchIndexUpdatesDeferred) return;
+    if (!this.searchIndexAvailable || !this.deleteDecisionSearchIndexStatement || !this.insertDecisionSearchIndexStatement) return;
+    try {
+      this.deleteDecisionSearchIndexStatement.run(String(id));
+      this.insertDecisionSearchIndexStatement.run(String(id), searchText);
+    } catch {
+      // Search indexing is an optimization; core table data remains authoritative.
+    }
+  }
+
+  private deleteAlertSearchIndex(id: string | number): void {
+    if (this.searchIndexUpdatesDeferred) return;
+    if (!this.searchIndexAvailable || !this.deleteAlertSearchIndexStatement) return;
+    try {
+      this.deleteAlertSearchIndexStatement.run(String(id));
+    } catch {
+      // Search indexing is an optimization; core table data remains authoritative.
+    }
+  }
+
+  private deleteAlertSearchIndexes(ids: string[]): void {
+    if (this.searchIndexUpdatesDeferred) return;
+    if (!this.searchIndexAvailable || ids.length === 0) return;
+    runChunkedIdMutation(this.db, 'DELETE FROM alerts_fts WHERE alert_id IN', ids);
+  }
+
+  private deleteDecisionSearchIndex(id: string | number): void {
+    if (this.searchIndexUpdatesDeferred) return;
+    if (!this.searchIndexAvailable || !this.deleteDecisionSearchIndexStatement) return;
+    try {
+      this.deleteDecisionSearchIndexStatement.run(String(id));
+    } catch {
+      // Search indexing is an optimization; core table data remains authoritative.
+    }
+  }
+
+  private deleteDecisionSearchIndexes(ids: string[]): void {
+    if (this.searchIndexUpdatesDeferred) return;
+    if (!this.searchIndexAvailable || ids.length === 0) return;
+    runChunkedIdMutation(this.db, 'DELETE FROM decisions_fts WHERE decision_id IN', ids);
+  }
+
+  private deleteDecisionSearchIndexesByAlertIds(alertIds: string[]): void {
+    if (this.searchIndexUpdatesDeferred) return;
+    if (!this.searchIndexAvailable || alertIds.length === 0) return;
+    const decisionIds: string[] = [];
+    const chunkSize = 900;
+    for (let offset = 0; offset < alertIds.length; offset += chunkSize) {
+      const chunk = alertIds.slice(offset, offset + chunkSize);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db.prepare(`SELECT id FROM decisions WHERE alert_id IN (${placeholders})`).all(...chunk) as Array<{ id: string | number }>;
+      decisionIds.push(...rows.map((row) => String(row.id)));
+    }
+    this.deleteDecisionSearchIndexes(decisionIds);
+  }
+
+  private runSearchIndexStatement(sql: string, ...params: unknown[]): void {
+    try {
+      this.db.prepare(sql).run(...params);
+    } catch {
+      // Search indexing is an optimization; core table data remains authoritative.
+    }
+  }
 }
 
 function runChunkedIdMutation(db: Database, statementPrefix: string, ids: string[], leadingParams: unknown[] = []): number {
@@ -894,12 +1339,23 @@ function openDatabase(dbPath: string): Database {
     database.exec('PRAGMA temp_store = MEMORY');
     database.exec('PRAGMA busy_timeout = 5000');
     database.exec('PRAGMA mmap_size = 268435456');
+    registerDatabaseFunctions(database);
     return database;
   } catch (error: any) {
     if (dbPath.startsWith('/app/data') && error?.code === 'EACCES') {
       return createDatabase('crowdsec.db');
     }
     throw error;
+  }
+}
+
+function registerDatabaseFunctions(database: Database): void {
+  try {
+    database.function?.('matches_ip_search_value', { deterministic: true }, (candidate: unknown, value: unknown) =>
+      matchesIpSearchValue(candidate as string | number | null | undefined, String(value ?? '')) ? 1 : 0,
+    );
+  } catch {
+    // Older better-sqlite3 builds may not expose custom functions; SQL callers also keep LIKE fallbacks.
   }
 }
 
@@ -938,7 +1394,7 @@ function normalizeBindingValue(value: unknown): unknown {
   return normalized;
 }
 
-function initSchema(db: Database, freshDatabase: boolean): void {
+function initSchema(db: Database, freshDatabase: boolean): boolean {
   const createAlertsTable = `
     CREATE TABLE IF NOT EXISTS alerts (
       id INTEGER PRIMARY KEY,
@@ -947,7 +1403,16 @@ function initSchema(db: Database, freshDatabase: boolean): void {
       scenario TEXT,
       source_ip TEXT,
       message TEXT,
-      raw_data TEXT
+      raw_data TEXT,
+      country TEXT,
+      country_name TEXT,
+      as_name TEXT,
+      target TEXT,
+      machine TEXT,
+      meta_search TEXT,
+      origins TEXT,
+      simulated INTEGER NOT NULL DEFAULT 0,
+      search_text TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
   `;
@@ -963,12 +1428,24 @@ function initSchema(db: Database, freshDatabase: boolean): void {
       type TEXT,
       origin TEXT,
       scenario TEXT,
-      raw_data TEXT
+      raw_data TEXT,
+      country TEXT,
+      country_name TEXT,
+      as_name TEXT,
+      target TEXT,
+      machine TEXT,
+      simulated INTEGER NOT NULL DEFAULT 0,
+      search_text TEXT,
+      is_duplicate INTEGER NOT NULL DEFAULT 0
     );
+  `;
+
+  const createDecisionIndexes = `
     CREATE INDEX IF NOT EXISTS idx_decisions_stop_at ON decisions(stop_at);
     CREATE INDEX IF NOT EXISTS idx_decisions_alert_id ON decisions(alert_id);
     CREATE INDEX IF NOT EXISTS idx_decisions_value ON decisions(value);
     CREATE INDEX IF NOT EXISTS idx_decisions_created_at ON decisions(created_at);
+    CREATE INDEX IF NOT EXISTS idx_decisions_stop_alert_id ON decisions(stop_at, alert_id);
     CREATE INDEX IF NOT EXISTS idx_decisions_value_stop_at ON decisions(value, stop_at DESC);
   `;
 
@@ -989,6 +1466,9 @@ function initSchema(db: Database, freshDatabase: boolean): void {
       totp_last_step INTEGER,
       role TEXT NOT NULL DEFAULT 'admin',
       auth_provider TEXT NOT NULL DEFAULT 'password',
+      oidc_issuer TEXT,
+      oidc_subject TEXT,
+      session_version INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -1131,11 +1611,296 @@ function initSchema(db: Database, freshDatabase: boolean): void {
     db.exec(createDecisionsTable);
   }
 
+  db.exec(createDecisionIndexes);
+  migrateRecordIndexColumns(db);
   migrateNotificationRulesTable(db, createNotificationRulesTable);
   migrateNotificationsTable(db, createNotificationsTable);
   migrateAuthUsersTable(db);
   db.exec(createNotificationIncidentsTable);
   seedNotificationIncidentsFromHistoryIfEmpty(db);
+  const searchIndexAvailable = initSearchIndexes(db);
+  if (searchIndexAvailable) {
+    backfillSearchIndexes(db);
+  }
+  return searchIndexAvailable;
+}
+
+function migrateRecordIndexColumns(db: Database): void {
+  ensureColumns(db, 'alerts', [
+    ['country', 'TEXT'],
+    ['country_name', 'TEXT'],
+    ['as_name', 'TEXT'],
+    ['target', 'TEXT'],
+    ['machine', 'TEXT'],
+    ['meta_search', 'TEXT'],
+    ['origins', 'TEXT'],
+    ['simulated', 'INTEGER NOT NULL DEFAULT 0'],
+    ['search_text', 'TEXT'],
+  ]);
+  ensureColumns(db, 'decisions', [
+    ['country', 'TEXT'],
+    ['country_name', 'TEXT'],
+    ['as_name', 'TEXT'],
+    ['target', 'TEXT'],
+    ['machine', 'TEXT'],
+    ['simulated', 'INTEGER NOT NULL DEFAULT 0'],
+    ['search_text', 'TEXT'],
+    ['is_duplicate', 'INTEGER NOT NULL DEFAULT 0'],
+  ]);
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_alerts_country ON alerts(country);
+    CREATE INDEX IF NOT EXISTS idx_alerts_scenario ON alerts(scenario);
+    CREATE INDEX IF NOT EXISTS idx_alerts_as_name ON alerts(as_name);
+    CREATE INDEX IF NOT EXISTS idx_alerts_target ON alerts(target);
+    CREATE INDEX IF NOT EXISTS idx_alerts_source_ip ON alerts(source_ip);
+    CREATE INDEX IF NOT EXISTS idx_alerts_simulated ON alerts(simulated);
+    CREATE INDEX IF NOT EXISTS idx_alerts_simulated_created_at ON alerts(simulated, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_alerts_country_created_at ON alerts(country, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_alerts_scenario_created_at ON alerts(scenario, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_decisions_country ON decisions(country);
+    CREATE INDEX IF NOT EXISTS idx_decisions_scenario ON decisions(scenario);
+    CREATE INDEX IF NOT EXISTS idx_decisions_as_name ON decisions(as_name);
+    CREATE INDEX IF NOT EXISTS idx_decisions_target ON decisions(target);
+    CREATE INDEX IF NOT EXISTS idx_decisions_simulated ON decisions(simulated);
+    CREATE INDEX IF NOT EXISTS idx_decisions_simulated_created_at ON decisions(simulated, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_decisions_alert_created_at ON decisions(alert_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_decisions_stop_alert_id ON decisions(stop_at, alert_id);
+    CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_active ON decisions(is_duplicate, stop_at, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_created_at ON decisions(is_duplicate, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_primary ON decisions(value, simulated, stop_at DESC, id);
+  `);
+
+  backfillRecordIndexes(db);
+}
+
+function ensureColumns(db: Database, tableName: string, columns: Array<[string, string]>): void {
+  const existing = new Set((db.query(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>).map((column) => column.name));
+  for (const [name, definition] of columns) {
+    if (!existing.has(name)) {
+      db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${name} ${definition}`);
+    }
+  }
+}
+
+function backfillRecordIndexes(db: Database): void {
+  const alertRowsStatement = db.query(`
+    SELECT id, created_at, scenario, source_ip, message, raw_data
+    FROM alerts
+    WHERE search_text IS NULL
+    LIMIT 500
+  `);
+  const updateAlertStatement = db.query(`
+    UPDATE alerts
+    SET created_at = $created_at,
+        scenario = $scenario,
+        source_ip = $source_ip,
+        country = $country,
+        country_name = $country_name,
+        as_name = $as_name,
+        target = $target,
+        machine = $machine,
+        meta_search = $meta_search,
+        origins = $origins,
+        simulated = $simulated,
+        search_text = $search_text
+    WHERE id = $id
+  `);
+
+  while (true) {
+    const rows = alertRowsStatement.all() as Array<{
+      id: string | number;
+      created_at: string;
+      scenario?: string | null;
+      source_ip?: string | null;
+      message?: string | null;
+      raw_data: string;
+    }>;
+    if (rows.length === 0) break;
+
+    const updateAlerts = db.transaction((items: typeof rows) => {
+      for (const row of items) {
+        const index = deriveAlertIndexValues(row.raw_data, {
+          createdAt: row.created_at,
+          scenario: row.scenario,
+          sourceIp: row.source_ip,
+          message: row.message,
+        });
+        updateAlertStatement.run({
+          $id: row.id,
+          $created_at: index.historyAt,
+          $scenario: index.scenario ?? row.scenario,
+          $source_ip: index.sourceIp ?? row.source_ip,
+          $country: index.country,
+          $country_name: index.countryName,
+          $as_name: index.asName,
+          $target: index.target,
+          $machine: index.machine,
+          $meta_search: index.metaSearch,
+          $origins: index.origins,
+          $simulated: index.simulated,
+          $search_text: index.searchText,
+        });
+      }
+    });
+    updateAlerts(rows);
+  }
+
+  const decisionRowsStatement = db.query(`
+    SELECT id, value, type, origin, scenario, raw_data
+    FROM decisions
+    WHERE search_text IS NULL
+    LIMIT 500
+  `);
+  const updateDecisionStatement = db.query(`
+    UPDATE decisions
+    SET country = $country,
+        country_name = $country_name,
+        as_name = $as_name,
+        target = $target,
+        machine = $machine,
+        simulated = $simulated,
+        search_text = $search_text
+    WHERE id = $id
+  `);
+
+  while (true) {
+    const rows = decisionRowsStatement.all() as Array<{
+      id: string;
+      value?: string | null;
+      type?: string | null;
+      origin?: string | null;
+      scenario?: string | null;
+      raw_data: string;
+    }>;
+    if (rows.length === 0) break;
+
+    const updateDecisions = db.transaction((items: typeof rows) => {
+      for (const row of items) {
+        const index = deriveDecisionIndexValues(row.raw_data, {
+          value: row.value,
+          type: row.type,
+          origin: row.origin,
+          scenario: row.scenario,
+        });
+        updateDecisionStatement.run({
+          $id: row.id,
+          $country: index.country,
+          $country_name: index.countryName,
+          $as_name: index.asName,
+          $target: index.target,
+          $machine: index.machine,
+          $simulated: index.simulated,
+          $search_text: index.searchText,
+        });
+      }
+    });
+    updateDecisions(rows);
+  }
+}
+
+function initSearchIndexes(db: Database): boolean {
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS alerts_fts USING fts5(
+        alert_id UNINDEXED,
+        search_text,
+        tokenize = 'unicode61'
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(
+        decision_id UNINDEXED,
+        search_text,
+        tokenize = 'unicode61'
+      );
+    `);
+    return true;
+  } catch (error) {
+    console.warn('SQLite FTS5 is unavailable; falling back to LIKE search.', (error as Error).message);
+    return false;
+  }
+}
+
+function backfillSearchIndexes(db: Database): void {
+  const alertCount = (db.query('SELECT COUNT(*) AS count FROM alerts_fts').get() as CountRow | null)?.count || 0;
+  if (alertCount === 0) {
+    db.exec(`
+      INSERT INTO alerts_fts(rowid, alert_id, search_text)
+      SELECT CAST(id AS INTEGER), CAST(id AS TEXT), search_text
+      FROM alerts
+      WHERE CAST(id AS TEXT) GLOB '[0-9]*'
+        AND CAST(id AS TEXT) NOT GLOB '*[^0-9]*'
+        AND CAST(id AS INTEGER) > 0
+        AND search_text IS NOT NULL
+        AND search_text <> ''
+    `);
+  }
+
+  const decisionCount = (db.query('SELECT COUNT(*) AS count FROM decisions_fts').get() as CountRow | null)?.count || 0;
+  if (decisionCount === 0) {
+    db.exec(`
+      INSERT INTO decisions_fts(decision_id, search_text)
+      SELECT CAST(id AS TEXT), search_text
+      FROM decisions
+      WHERE search_text IS NOT NULL
+        AND search_text <> ''
+    `);
+  }
+}
+
+async function backfillSearchIndexesCooperative(db: Database, yieldControl: () => Promise<void>, batchSize: number): Promise<void> {
+  let lastAlertId = 0;
+  const selectAlerts = db.query(`
+    SELECT id, search_text
+    FROM alerts
+    WHERE id > ?
+      AND search_text IS NOT NULL
+      AND search_text <> ''
+    ORDER BY id
+    LIMIT ?
+  `);
+  const insertAlerts = db.transaction((rows: Array<{ id: number; search_text: string }>) => {
+    const insert = db.prepare('INSERT INTO alerts_fts(rowid, alert_id, search_text) VALUES (?, ?, ?)');
+    for (const row of rows) {
+      insert.run(row.id, String(row.id), row.search_text);
+    }
+  });
+
+  while (true) {
+    const rows = selectAlerts.all(lastAlertId, batchSize) as Array<{ id: number; search_text: string }>;
+    if (rows.length === 0) {
+      break;
+    }
+    insertAlerts(rows);
+    lastAlertId = rows[rows.length - 1].id;
+    await yieldControl();
+  }
+
+  let lastDecisionRowId = 0;
+  const selectDecisions = db.query(`
+    SELECT rowid, id, search_text
+    FROM decisions
+    WHERE rowid > ?
+      AND search_text IS NOT NULL
+      AND search_text <> ''
+    ORDER BY rowid
+    LIMIT ?
+  `);
+  const insertDecisions = db.transaction((rows: Array<{ id: string; rowid: number; search_text: string }>) => {
+    const insert = db.prepare('INSERT INTO decisions_fts(decision_id, search_text) VALUES (?, ?)');
+    for (const row of rows) {
+      insert.run(String(row.id), row.search_text);
+    }
+  });
+
+  while (true) {
+    const rows = selectDecisions.all(lastDecisionRowId, batchSize) as Array<{ id: string; rowid: number; search_text: string }>;
+    if (rows.length === 0) {
+      break;
+    }
+    insertDecisions(rows);
+    lastDecisionRowId = rows[rows.length - 1].rowid;
+    await yieldControl();
+  }
 }
 
 function migrateAuthUsersTable(db: Database): void {
@@ -1149,6 +1914,20 @@ function migrateAuthUsersTable(db: Database): void {
   if (!columns.some((column) => column.name === 'totp_last_step')) {
     db.exec('ALTER TABLE auth_users ADD COLUMN totp_last_step INTEGER');
   }
+  if (!columns.some((column) => column.name === 'oidc_issuer')) {
+    db.exec('ALTER TABLE auth_users ADD COLUMN oidc_issuer TEXT');
+  }
+  if (!columns.some((column) => column.name === 'oidc_subject')) {
+    db.exec('ALTER TABLE auth_users ADD COLUMN oidc_subject TEXT');
+  }
+  if (!columns.some((column) => column.name === 'session_version')) {
+    db.exec('ALTER TABLE auth_users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1');
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_oidc_identity
+    ON auth_users(oidc_issuer, oidc_subject)
+    WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL
+  `);
 }
 
 function migrateNotificationRulesTable(db: Database, createNotificationRulesTable: string): void {

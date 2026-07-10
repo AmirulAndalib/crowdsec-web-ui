@@ -81,6 +81,8 @@ describe('CrowdsecDatabase', () => {
     db.setMeta('refresh_interval_ms', '5000');
 
     expect(db.countAlerts()).toBe(1);
+    expect(db.searchIndexAvailable).toBe(true);
+    expect((db.db.prepare('SELECT COUNT(*) AS count FROM alerts_fts WHERE alerts_fts MATCH ?').get('alert') as { count: number }).count).toBe(1);
     expect(db.getAlertsSince('2024-12-31T00:00:00.000Z')).toHaveLength(1);
     expect(db.getActiveDecisions('2025-01-01T00:00:00.000Z')).toHaveLength(1);
     expect(db.getDecisionById('10')?.stop_at).toBe('2030-01-01T00:00:00.000Z');
@@ -119,10 +121,114 @@ describe('CrowdsecDatabase', () => {
     db.close();
   });
 
+  test('treats unchanged sync upserts as no-ops', () => {
+    const db = createTestDatabase();
+    const alert = {
+      $id: 1,
+      $uuid: 'alert-1',
+      $created_at: '2025-01-01T00:00:00.000Z',
+      $scenario: 'crowdsecurity/ssh-bf',
+      $source_ip: '1.2.3.4',
+      $message: 'alert',
+      $raw_data: JSON.stringify({ id: 1, message: 'alert' }),
+    };
+    const decision = {
+      $id: '10',
+      $uuid: '10',
+      $alert_id: 1,
+      $created_at: '2025-01-01T00:00:00.000Z',
+      $stop_at: '2030-01-01T00:00:00.000Z',
+      $value: '1.2.3.4',
+      $type: 'ban',
+      $origin: 'manual',
+      $scenario: 'crowdsecurity/ssh-bf',
+      $raw_data: JSON.stringify({ id: 10, value: '1.2.3.4', stop_at: '2030-01-01T00:00:00.000Z' }),
+    };
+
+    expect(db.insertAlert(alert)).toBe(true);
+    expect(db.insertDecision(decision)).toBe(true);
+    db.db.prepare('UPDATE decisions SET is_duplicate = 1 WHERE id = ?').run('10');
+
+    expect(db.insertAlert(alert)).toBe(false);
+    expect(db.insertDecision(decision)).toBe(false);
+    expect((db.db.prepare('SELECT is_duplicate FROM decisions WHERE id = ?').get('10') as { is_duplicate: number }).is_duplicate).toBe(1);
+    expect((db.db.prepare('SELECT COUNT(*) AS count FROM alerts_fts').get() as { count: number }).count).toBe(1);
+    expect((db.db.prepare('SELECT COUNT(*) AS count FROM decisions_fts').get() as { count: number }).count).toBe(1);
+
+    expect(db.insertAlert({ ...alert, $message: 'updated', $raw_data: JSON.stringify({ id: 1, message: 'updated' }) })).toBe(true);
+    expect(db.insertDecision({ ...decision, $stop_at: '2031-01-01T00:00:00.000Z' })).toBe(true);
+    expect((db.db.prepare('SELECT is_duplicate FROM decisions WHERE id = ?').get('10') as { is_duplicate: number }).is_duplicate).toBe(0);
+
+    db.close();
+  });
+
   test('fresh databases default dashboard auth on', () => {
     const db = createTestDatabase();
 
     expect(db.isAuthMigrationDefaultDisabled()).toBe(false);
+
+    db.close();
+  });
+
+  test('binds OIDC users to issuer and subject without merging local usernames', () => {
+    const db = createTestDatabase();
+    const localUserId = db.createAuthUser({
+      username: 'operator',
+      passwordHash: 'local-password-hash',
+      role: 'admin',
+      authProvider: 'password',
+    });
+
+    const oidcUser = db.upsertOidcUser({
+      username: 'operator',
+      role: 'read-only',
+      issuer: 'https://idp.example.com',
+      subject: 'subject-1',
+    });
+    expect(oidcUser.id).not.toBe(localUserId);
+    expect(oidcUser.username).toMatch(/^operator#oidc-/);
+    expect(oidcUser.oidc_issuer).toBe('https://idp.example.com');
+    expect(oidcUser.oidc_subject).toBe('subject-1');
+    expect(db.getAuthUserById(localUserId)).toMatchObject({
+      username: 'operator',
+      auth_provider: 'password',
+      password_hash: 'local-password-hash',
+      role: 'admin',
+    });
+
+    const renamedOidcUser = db.upsertOidcUser({
+      username: 'renamed-operator',
+      role: 'admin',
+      issuer: 'https://idp.example.com',
+      subject: 'subject-1',
+    });
+    expect(renamedOidcUser.id).toBe(oidcUser.id);
+    expect(renamedOidcUser.username).toBe('renamed-operator');
+    expect(renamedOidcUser.session_version).toBe(oidcUser.session_version + 1);
+
+    db.close();
+  });
+
+  test('migrates legacy OIDC users in place on their next login', () => {
+    const db = createTestDatabase();
+    const legacyId = db.createAuthUser({
+      username: 'legacy-oidc',
+      passwordHash: null,
+      role: 'read-only',
+      authProvider: 'oidc',
+    });
+
+    const migrated = db.upsertOidcUser({
+      username: 'legacy-oidc',
+      role: 'read-only',
+      issuer: 'https://idp.example.com',
+      subject: 'legacy-subject',
+    });
+    expect(migrated.id).toBe(legacyId);
+    expect(migrated).toMatchObject({
+      oidc_issuer: 'https://idp.example.com',
+      oidc_subject: 'legacy-subject',
+    });
 
     db.close();
   });
@@ -146,6 +252,69 @@ describe('CrowdsecDatabase', () => {
     const db = new CrowdsecDatabase({ dbPath });
 
     expect(db.isAuthMigrationDefaultDisabled()).toBe(true);
+
+    db.close();
+  });
+
+  test('migrates legacy decision tables before creating duplicate indexes', () => {
+    const dbPath = createTestDatabasePath();
+    const legacy = createLegacyDatabase(dbPath);
+    legacy.exec(`
+      CREATE TABLE alerts (
+        id INTEGER PRIMARY KEY,
+        uuid TEXT UNIQUE,
+        created_at TEXT NOT NULL,
+        scenario TEXT,
+        source_ip TEXT,
+        message TEXT,
+        raw_data TEXT
+      );
+      CREATE TABLE decisions (
+        id TEXT PRIMARY KEY,
+        uuid TEXT UNIQUE,
+        alert_id INTEGER,
+        created_at TEXT NOT NULL,
+        stop_at TEXT NOT NULL,
+        value TEXT,
+        type TEXT,
+        origin TEXT,
+        scenario TEXT,
+        raw_data TEXT
+      );
+      INSERT INTO decisions (
+        id, uuid, alert_id, created_at, stop_at, value, type, origin, scenario, raw_data
+      )
+      VALUES (
+        '10',
+        'decision-10',
+        1,
+        '2026-01-01T00:00:00.000Z',
+        '2030-01-01T00:00:00.000Z',
+        '1.2.3.4',
+        'ban',
+        'cscli',
+        'crowdsecurity/ssh-bf',
+        '{"id":10,"value":"1.2.3.4","stop_at":"2030-01-01T00:00:00.000Z"}'
+      );
+    `);
+    legacy.close();
+
+    const db = new CrowdsecDatabase({ dbPath });
+    const columns = db.db.prepare('PRAGMA table_info(decisions)').all() as Array<{ name: string }>;
+    const indexes = db.db.prepare(`
+      SELECT name
+      FROM sqlite_master
+      WHERE type = 'index' AND tbl_name = 'decisions'
+    `).all() as Array<{ name: string }>;
+    const row = db.db.prepare('SELECT is_duplicate FROM decisions WHERE id = ?').get('10') as { is_duplicate: number };
+
+    expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining(['is_duplicate', 'search_text', 'simulated']));
+    expect(indexes.map((index) => index.name)).toEqual(expect.arrayContaining([
+      'idx_decisions_duplicate_active',
+      'idx_decisions_duplicate_created_at',
+    ]));
+    expect(row.is_duplicate).toBe(0);
+    expect(db.getDecisionById('10')?.stop_at).toBe('2030-01-01T00:00:00.000Z');
 
     db.close();
   });

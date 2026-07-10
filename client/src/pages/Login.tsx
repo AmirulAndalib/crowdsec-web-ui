@@ -47,6 +47,8 @@ export function Login() {
         return t('pages.login.error.failedToStartPasskeyLogin');
       case 'No passkey credential returned':
         return t('pages.login.error.noPasskeyCredential');
+      case 'This passkey belongs to an OIDC-only account. Sign in with SSO instead.':
+        return t('pages.login.error.oidcOnlyPasskey');
       case 'Passkey authentication failed':
         return t('pages.login.error.passkeyAuthenticationFailed');
       default:
@@ -132,7 +134,7 @@ export function Login() {
     <div className="flex min-h-screen items-center justify-center bg-gray-950 p-4 text-gray-100">
       <div className="w-full max-w-sm rounded-xl border border-gray-800 bg-gray-900 p-8 shadow-2xl">
         <div className="mb-6 text-center">
-          <img src={assetUrl('/logo.svg')} alt="" className="mx-auto h-14 w-14" />
+          <img src={assetUrl('/logo-sidebar.png')} alt="" className="mx-auto h-14 w-14" />
           <h1 className="mt-4 text-2xl font-bold">{t('pages.login.title')}</h1>
           <p className="mt-1 text-sm text-gray-400">{t('pages.login.subtitle')}</p>
         </div>

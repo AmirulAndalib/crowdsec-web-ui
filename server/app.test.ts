@@ -4,12 +4,12 @@ import path from 'path';
 import { tmpdir } from 'os';
 import crypto from 'node:crypto';
 import { generate } from 'otplib';
-import type { AlertRecord } from '../shared/contracts';
+import type { AlertRecord, PaginatedResponse, SlimAlert } from '../shared/contracts';
 import { resolveMachineName } from '../shared/machine';
 import { createRuntimeConfig } from './config';
 import { CrowdsecDatabase } from './database';
 import { LapiClient, type LapiRequestInit } from './lapi';
-import { createApp } from './app';
+import { createApp, type CreateAppOptions } from './app';
 import { resolveOidcRole } from './app-auth';
 import { resolveAlertHistoryAt } from './utils/alerts';
 import { parseGoDuration } from './utils/duration';
@@ -117,14 +117,15 @@ function createAuthSessionCookie(
   database: CrowdsecDatabase,
   payload: { userId: number; username: string; role: 'admin' | 'read-only'; authMethod: 'password' | 'passkey' | 'oidc' },
   configuredSecret?: string,
+  times: { issuedAt?: number; expiresAt?: number } = {},
 ): string {
   const secret = configuredSecret || database.getMeta('auth_session_secret')?.value;
   if (!secret) throw new Error('Auth session secret was not initialized');
   const now = Math.floor(Date.now() / 1000);
   const encodedPayload = Buffer.from(JSON.stringify({
     ...payload,
-    iat: now,
-    exp: now + 60 * 60,
+    iat: times.issuedAt ?? now,
+    exp: times.expiresAt ?? now + 60 * 60,
   })).toString('base64url');
   const signature = crypto.createHmac('sha256', secret).update(encodedPayload).digest('base64url');
   return `crowdsec_web_ui_session=${encodedPayload}.${signature}`;
@@ -363,6 +364,7 @@ function createTestDistRoot(): string {
   writeFileSync(path.join(distRoot, 'assets', 'app.js'), 'console.log("ok");');
   writeFileSync(path.join(distRoot, 'world-50m.json'), '{"type":"Topology"}');
   writeFileSync(path.join(distRoot, 'logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+  writeFileSync(path.join(distRoot, 'logo-sidebar.png'), 'png');
   return distRoot;
 }
 
@@ -375,6 +377,7 @@ function createController(options: {
   notificationFetchResolver?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined;
   metricsFetchResolver?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined;
   mqttPublishResolver?: (config: MqttPublishConfig, payload: string) => void | Promise<void>;
+  syncWorker?: CreateAppOptions['syncWorker'];
 } = {}) {
   const authMode = options.authMode || 'password';
   const mtlsCertPath = path.join(tempDir, 'agent.pem');
@@ -494,6 +497,7 @@ function createController(options: {
     mqttPublishImpl: async (config, payload) => {
       await options.mqttPublishResolver?.(config, payload);
     },
+    syncWorker: options.syncWorker,
   });
 
   return { controller, database, lapiClient, fetchCalls };
@@ -531,6 +535,63 @@ test('dashboard auth protects API routes and allows initial setup login', async 
   expect(authenticated.status).toBe(200);
   const payload = await authenticated.json() as { permissions?: { mode?: string } };
   expect(payload.permissions?.mode).toBe('admin');
+});
+
+test('security middleware applies CSP, private API caching, origin checks, and body limits', async () => {
+  const { controller } = createController();
+
+  const page = await controller.fetch(new Request('http://localhost/crowdsec/'));
+  const pageHtml = await page.text();
+  const csp = page.headers.get('content-security-policy') || '';
+  const nonce = csp.match(/'nonce-([^']+)'/)?.[1];
+  expect(nonce).toBeTruthy();
+  expect(csp).toContain("default-src 'self'");
+  expect(csp).toContain("frame-ancestors 'none'");
+  expect(pageHtml).toContain(`<script nonce="${nonce}">window.__BASE_PATH__="/crowdsec";</script>`);
+  expect(page.headers.get('strict-transport-security')).toBeNull();
+
+  const apiResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/config'));
+  expect(apiResponse.headers.get('cache-control')).toBe('private, no-store');
+
+  const crossOrigin = await controller.fetch(new Request('http://localhost/crowdsec/api/config/language', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://attacker.example' },
+    body: JSON.stringify({ language: 'de' }),
+  }));
+  expect(crossOrigin.status).toBe(403);
+  expect(await crossOrigin.json()).toEqual({ error: 'Cross-origin request rejected' });
+
+  const oversized = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: 'x'.repeat(1024 * 1024) }),
+  }));
+  expect(oversized.status).toBe(413);
+});
+
+test('password throttling cannot be bypassed with spoofed forwarded addresses', async () => {
+  const { controller } = createController({ env: { AUTH_ENABLED: 'true' } });
+  await controller.fetch(new Request('http://localhost/crowdsec/api/auth/setup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: 'Secret123' }),
+  }));
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const response = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': `198.51.100.${attempt + 1}` },
+      body: JSON.stringify({ username: 'admin', password: 'WrongSecret123' }),
+    }));
+    expect(response.status).toBe(401);
+  }
+
+  const throttled = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '203.0.113.250' },
+    body: JSON.stringify({ username: 'admin', password: 'WrongSecret123' }),
+  }));
+  expect(throttled.status).toBe(429);
 });
 
 test('CrowdSec metrics endpoint is disabled until Prometheus URL is configured', async () => {
@@ -635,6 +696,7 @@ test('dashboard auth exposes account settings and password changes', async () =>
     oidcReadOnlyGroups: '',
     oidcUnmatchedRole: 'deny',
     hasPassword: true,
+    passkeysAvailable: true,
     totpEnabled: false,
     authMethod: 'password',
   });
@@ -714,6 +776,17 @@ test('dashboard auth exposes account settings and password changes', async () =>
     body: JSON.stringify({ currentPassword: 'Secret123', newPassword: 'NewSecret123' }),
   }));
   expect(changePassword.status).toBe(200);
+  const refreshedCookie = changePassword.headers.get('set-cookie') || '';
+  expect(refreshedCookie).toContain('crowdsec_web_ui_session=');
+
+  const revokedOldSession = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/settings', {
+    headers: { cookie },
+  }));
+  expect(revokedOldSession.status).toBe(401);
+  const refreshedSession = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/settings', {
+    headers: { cookie: refreshedCookie },
+  }));
+  expect(refreshedSession.status).toBe(200);
 
   const oldLogin = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/login', {
     method: 'POST',
@@ -728,6 +801,90 @@ test('dashboard auth exposes account settings and password changes', async () =>
     body: JSON.stringify({ username: 'admin', password: 'NewSecret123' }),
   }));
   expect(newLogin.status).toBe(200);
+});
+
+test('OIDC-only users cannot persist SSO access by registering or using passkeys', async () => {
+  const { controller, database } = createController({ env: { AUTH_ENABLED: 'true' } });
+  const user = database.upsertOidcUser({
+    username: 'oidc-admin',
+    role: 'admin',
+    issuer: 'https://idp.example.com',
+    subject: 'oidc-subject',
+  });
+  const oidcCookie = createAuthSessionCookie(database, {
+    userId: user.id,
+    username: user.username,
+    role: user.role,
+    authMethod: 'oidc',
+  });
+
+  const settings = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/settings', {
+    headers: { cookie: oidcCookie },
+  }));
+  expect(settings.status).toBe(200);
+  expect(await settings.json()).toMatchObject({
+    hasPassword: false,
+    passkeysAvailable: false,
+    authMethod: 'oidc',
+  });
+
+  const passkeys = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/passkeys', {
+    headers: { cookie: oidcCookie },
+  }));
+  expect(passkeys.status).toBe(403);
+  expect(await passkeys.json()).toMatchObject({
+    error: 'Passkeys are unavailable for OIDC-only accounts',
+  });
+
+  const registration = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/webauthn/register/options', {
+    method: 'POST',
+    headers: { cookie: oidcCookie },
+  }));
+  expect(registration.status).toBe(403);
+  expect(await registration.json()).toMatchObject({
+    error: 'Passkeys cannot be registered for OIDC-only accounts',
+  });
+
+  database.createWebAuthnCredential({
+    userId: user.id,
+    credentialId: 'oidc-only-passkey',
+    publicKey: 'unused-for-oidc-only-account',
+    signCount: 0,
+    transports: '[]',
+    name: 'Legacy passkey',
+  });
+  const loginOptions = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/webauthn/login/options', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: user.username }),
+  }));
+  const blockedPasskeyLogin = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/webauthn/login/verify', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      cookie: loginOptions.headers.get('set-cookie') || '',
+    },
+    body: JSON.stringify({ id: 'oidc-only-passkey' }),
+  }));
+  expect(blockedPasskeyLogin.status).toBe(403);
+  expect(await blockedPasskeyLogin.json()).toMatchObject({
+    error: 'This passkey belongs to an OIDC-only account. Sign in with SSO instead.',
+  });
+
+  const now = Math.floor(Date.now() / 1000);
+  const staleOidcCookie = createAuthSessionCookie(database, {
+    userId: user.id,
+    username: user.username,
+    role: user.role,
+    authMethod: 'oidc',
+  }, undefined, {
+    issuedAt: now - 25 * 60 * 60,
+    expiresAt: now + 60 * 60,
+  });
+  const staleSession = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/settings', {
+    headers: { cookie: staleOidcCookie },
+  }));
+  expect(staleSession.status).toBe(401);
 });
 
 test('dashboard auth supports optional TOTP for password login', async () => {
@@ -1229,11 +1386,15 @@ describe('createApp', () => {
 
     const worldMap = await controller.fetch(new Request('http://localhost/crowdsec/world-50m.json'));
     expect(worldMap.status).toBe(200);
+    expect(worldMap.headers.get('cache-control')).toBe('public, max-age=86400, stale-while-revalidate=604800');
     expect((await worldMap.text()).startsWith('{"type"')).toBe(true);
 
     const logo = await controller.fetch(new Request('http://localhost/crowdsec/logo.svg'));
     expect(logo.status).toBe(200);
     expect((await logo.text()).includes('<svg')).toBe(true);
+
+    const sidebarLogo = await controller.fetch(new Request('http://localhost/crowdsec/logo-sidebar.png'));
+    expect(sidebarLogo.status).toBe(200);
 
     const asset = await controller.fetch(new Request('http://localhost/crowdsec/assets/app.js'));
     expect(asset.status).toBe(200);
@@ -1494,6 +1655,39 @@ describe('createApp', () => {
       filteredTotals: { alerts: number; decisions: number; simulatedAlerts: number; simulatedDecisions: number };
     }).toEqual(expect.objectContaining({
       filteredTotals: { alerts: 3, decisions: 2, simulatedAlerts: 1, simulatedDecisions: 1 },
+    }));
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('serves finalized dashboard stats immediately after initial sync', async () => {
+    const alert = sampleAlert({
+      id: 301,
+      uuid: 'dashboard-alert-301',
+      created_at: new Date().toISOString(),
+      source: { ip: '1.2.3.4', value: '1.2.3.4', cn: 'DE', as_name: 'Hetzner' },
+      target: 'ssh',
+    });
+    const { controller, database, lapiClient } = createController({
+      fetchResolver: (url) => url.includes('/v1/alerts?') ? Response.json([alert]) : undefined,
+    });
+
+    seedAlert(database, alert);
+    await lapiClient.login();
+
+    const alertsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10'));
+    expect(alertsResponse.status).toBe(200);
+
+    const dashboardResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats?granularity=day'));
+    expect(dashboardResponse.status).toBe(200);
+    expect((await dashboardResponse.json()) as {
+      totals: { alerts: number; decisions: number };
+      topCountries: Array<{ countryCode?: string; count: number }>;
+    }).toEqual(expect.objectContaining({
+      totals: expect.objectContaining({ alerts: 1, decisions: 1 }),
+      topCountries: [expect.objectContaining({ countryCode: 'DE', count: 1 })],
     }));
 
     controller.stopBackgroundTasks();
@@ -1898,6 +2092,24 @@ describe('createApp', () => {
       }),
     );
 
+    const liveAlertsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=sim<>simulated'));
+    expect(liveAlertsResponse.status).toBe(200);
+    expect((await liveAlertsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 1 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    const typoAlertsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=sim<>simulatd'));
+    expect(typoAlertsResponse.status).toBe(200);
+    expect((await typoAlertsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [],
+        pagination: expect.objectContaining({ total: 0 }),
+      }),
+    );
+
     const decisionsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=10&q=status:active%20AND%20alert:1%20AND%20duplicate:false'));
     expect(decisionsResponse.status).toBe(200);
     expect((await decisionsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
@@ -1906,6 +2118,72 @@ describe('createApp', () => {
         pagination: expect.objectContaining({ total: 1 }),
       }),
     );
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('serves the first paginated alert page from a 100k-row cache', async () => {
+    const { controller, database } = createController({
+      env: {
+        CROWDSEC_LOOKBACK_PERIOD: '168h',
+      },
+    });
+    const bootstrap = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts'));
+    expect(bootstrap.status).toBe(200);
+    const now = Date.now();
+    const insert = database.db.prepare(`
+      INSERT INTO alerts (
+        id, uuid, created_at, scenario, source_ip, message, raw_data,
+        country, country_name, as_name, target, machine, meta_search, origins, simulated, search_text
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertSearch = database.db.prepare('INSERT INTO alerts_fts(rowid, alert_id, search_text) VALUES (?, ?, ?)');
+    const insertMany = database.db.transaction((count: number) => {
+      for (let index = 1; index <= count; index += 1) {
+        const createdAt = new Date(now - index * 1_000).toISOString();
+        const ip = `10.42.${Math.floor(index / 256) % 256}.${index % 256}`;
+        const searchText = `perf scenario ${ip} germany ssh`;
+        insert.run(
+          index,
+          `perf-alert-${index}`,
+          createdAt,
+          'perf/scenario',
+          ip,
+          'perf alert',
+          JSON.stringify({
+            id: index,
+            uuid: `perf-alert-${index}`,
+            created_at: createdAt,
+            scenario: 'perf/scenario',
+            source: { ip, value: ip, cn: 'DE', as_name: 'Perf AS' },
+            target: 'ssh',
+            decisions: [],
+            simulated: false,
+          }),
+          'DE',
+          'Germany',
+          'Perf AS',
+          'ssh',
+          'perf-host',
+          'perf',
+          '',
+          0,
+          searchText,
+        );
+        insertSearch.run(index, String(index), searchText);
+      }
+    });
+    insertMany(100_000);
+
+    const response = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=50&q=perf'));
+    expect(response.status).toBe(200);
+    const payload = await response.json() as PaginatedResponse<SlimAlert>;
+    expect(payload.data).toHaveLength(50);
+    expect(payload.pagination.total).toBe(100_000);
+    expect(payload.selectable_ids).toHaveLength(50);
 
     controller.stopBackgroundTasks();
     database.close();
@@ -2295,6 +2573,46 @@ describe('createApp', () => {
       call.url.includes('/v1/alerts?') && call.url.includes('has_active_decision=true'),
     );
     expect(activeRequests.length).toBeGreaterThan(3);
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('keeps the initial sync visible until indexes and dashboard data are finalized', async () => {
+    let releaseIndexRebuild = () => {};
+    const indexRebuild = new Promise<void>((resolve) => {
+      releaseIndexRebuild = resolve;
+    });
+    const syncWorker: NonNullable<CreateAppOptions['syncWorker']> = {
+      persistAlerts: vi.fn(async () => ({ changed: false })),
+      deleteAlertsMissingBetween: vi.fn(async () => ({ alerts: 0, decisions: 0 })),
+      deleteCachedAlerts: vi.fn(async () => ({ alerts: 0, decisions: 0 })),
+      deleteCachedDecisions: vi.fn(async () => 0),
+      beginDeferredSearchIndexUpdates: vi.fn(async () => {}),
+      rebuildSearchIndexes: vi.fn(() => indexRebuild),
+      refreshDecisionDuplicateFlags: vi.fn(async () => {}),
+      cleanupOldData: vi.fn(async () => ({ alerts: 0, decisions: 0 })),
+      clearSyncData: vi.fn(async () => {}),
+      close: vi.fn(),
+    };
+    const { controller, database } = createController({ syncWorker });
+
+    const alertsRequest = controller.fetch(new Request('http://localhost/crowdsec/api/alerts'));
+    await vi.waitFor(() => expect(syncWorker.rebuildSearchIndexes).toHaveBeenCalled());
+    expect(controller.getSyncStatus()).toEqual(expect.objectContaining({
+      isSyncing: true,
+      progress: 100,
+      completedAt: null,
+    }));
+
+    releaseIndexRebuild();
+    expect((await alertsRequest).status).toBe(200);
+    expect(controller.getSyncStatus()).toEqual(expect.objectContaining({
+      isSyncing: false,
+      progress: 100,
+      completedAt: expect.any(String),
+    }));
 
     controller.stopBackgroundTasks();
     database.close();
@@ -3563,10 +3881,7 @@ describe('createApp', () => {
     expect(addDecision.status).toBe(200);
     expect(notificationFinished).toBe(false);
 
-    for (let index = 0; index < 10 && !notificationStarted; index += 1) {
-      await Promise.resolve();
-    }
-    expect(notificationStarted).toBe(true);
+    await vi.waitFor(() => expect(notificationStarted).toBe(true));
 
     releaseNotification();
     for (let index = 0; index < 10 && !notificationFinished; index += 1) {
