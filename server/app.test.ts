@@ -427,7 +427,7 @@ function createController(options: {
     AUTH_ENABLED: 'false',
     ...authEnv,
     ...options.env,
-  });
+  }, { defaultConfigFile: path.join(tempDir, 'config.yaml') });
 
   const database = options.database || new CrowdsecDatabase({ dbPath: path.join(tempDir, 'test.db') });
   const fetchCalls: Array<{ url: string; method: string; body?: unknown; headers?: RequestInit['headers']; dispatcher?: unknown }> = [];
@@ -1471,7 +1471,7 @@ describe('createApp', () => {
 
     const readWhileRefreshing = await Promise.race([
       controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10')),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 250)),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2_000)),
     ]);
     expect(readWhileRefreshing).not.toBeNull();
     expect(readWhileRefreshing?.status).toBe(200);

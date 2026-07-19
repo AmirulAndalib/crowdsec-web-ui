@@ -59,11 +59,14 @@ export interface NotificationServiceOptions {
   mqttPublishImpl?: (config: MqttPublishConfig, payload: string) => Promise<void>;
   updateChecker?: UpdateChecker;
   getLapiStatus?: () => LapiStatus;
+  getLapiStatuses?: () => Array<{ instanceId: string; instanceName: string; status: LapiStatus }>;
   outboundGuard: NotificationOutboundGuard;
   secretStore: NotificationSecretStore;
   debugPayloads?: boolean;
   timeZone?: string | null;
   timeFormat?: TimeFormat;
+  instanceAware?: boolean;
+  instances?: ReadonlyArray<{ id: string; name: string }>;
 }
 
 interface NotificationCandidate {
@@ -124,9 +127,13 @@ export function createNotificationService(options: NotificationServiceOptions): 
   const mqttPublishImpl = options.mqttPublishImpl;
   const updateChecker = options.updateChecker;
   const getLapiStatus = options.getLapiStatus;
+  const getLapiStatuses = options.getLapiStatuses;
   const outboundGuard = options.outboundGuard;
   const secretStore = options.secretStore;
   const debugPayloads = options.debugPayloads === true;
+  const instanceAware = options.instanceAware === true;
+  const instanceNames = new Map((options.instances || []).map((instance) => [instance.id, instance.name]));
+  const instanceOrder = new Map((options.instances || []).map((instance, index) => [instance.id, index]));
 
   return {
     listSettings,
@@ -596,8 +603,10 @@ export function createNotificationService(options: NotificationServiceOptions): 
     const windowMs = config.window_minutes * 60_000;
     const currentStart = now.getTime() - windowMs;
     const previousStart = currentStart - windowMs;
-    const currentAlertCount = await countAlertsBetween(new Date(currentStart), now, config.filters);
-    const previousAlertCount = await countAlertsBetween(new Date(previousStart), new Date(currentStart), config.filters);
+    const currentAlertCounts = await countAlertsByInstanceBetween(new Date(currentStart), now, config.filters);
+    const previousAlertCounts = await countAlertsByInstanceBetween(new Date(previousStart), new Date(currentStart), config.filters);
+    const currentAlertCount = sumCounts(currentAlertCounts);
+    const previousAlertCount = sumCounts(previousAlertCounts);
     const baseline = Math.max(previousAlertCount, 1);
     const increasePercent = ((currentAlertCount - previousAlertCount) / baseline) * 100;
 
@@ -609,7 +618,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
       return [];
     }
 
-    return [{
+    return [withInstanceContext({
       dedupeKey: 'spike:active',
       title: t('server.notifications.alertSpike.title', { ruleName: rule.name }),
       message: t('server.notifications.alertSpike.message', {
@@ -625,19 +634,20 @@ export function createNotificationService(options: NotificationServiceOptions): 
         window_minutes: config.window_minutes,
         filters: toMetaRecord(config.filters),
       },
-    }];
+    }, [...currentAlertCounts.keys()])];
   }
 
   async function evaluateAlertThresholdRule(rule: NotificationRule, now: Date, t: Translator): Promise<NotificationCandidate[]> {
     const config = normalizeRuleConfig('alert-threshold', rule.config);
     const windowMs = config.window_minutes * 60_000;
-    const alertCount = await countAlertsBetween(new Date(now.getTime() - windowMs), now, config.filters);
+    const alertCounts = await countAlertsByInstanceBetween(new Date(now.getTime() - windowMs), now, config.filters);
+    const alertCount = sumCounts(alertCounts);
 
     if (alertCount < config.alert_threshold) {
       return [];
     }
 
-    return [{
+    return [withInstanceContext({
       dedupeKey: 'threshold:active',
       title: t('server.notifications.alertThreshold.title', { ruleName: rule.name }),
       message: t('server.notifications.alertThreshold.message', {
@@ -651,7 +661,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
         window_minutes: config.window_minutes,
         filters: toMetaRecord(config.filters),
       },
-    }];
+    }, [...alertCounts.keys()])];
   }
 
   async function evaluateNewAlertDecisionRule(rule: NotificationRule, now: Date, t: Translator): Promise<NotificationCandidate[]> {
@@ -662,13 +672,14 @@ export function createNotificationService(options: NotificationServiceOptions): 
     if (config.event_type === 'alert' || config.event_type === 'both') {
       for (const alert of await getAlertsBetween(windowStart, now, config.filters)) {
         const alertId = String(alert.id);
+        const instanceId = String((alert as AlertRecord & { instance_id?: string }).instance_id || 'default');
         const source = getAlertSourceValue(alert);
         const scenario = String(alert.scenario || alert.reason || '—');
         const target = String(alert.target || '—');
         const description = String(alert.message || '—');
 
-        candidates.push({
-          dedupeKey: `new-alert:${encodeURIComponent(alertId)}`,
+        candidates.push(withInstanceContext({
+          dedupeKey: `${instanceAware ? `${encodeURIComponent(instanceId)}:` : ''}new-alert:${encodeURIComponent(alertId)}`,
           title: t('server.notifications.newEvent.alertTitle', { ruleName: rule.name }),
           message: t('server.notifications.newEvent.alertMessage', {
             id: alertId,
@@ -681,6 +692,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
           incidentStartedAt: alert.created_at,
           metadata: {
             event_type: 'alert',
+            instance_id: instanceId,
             alert_id: alertId,
             uuid: typeof alert.uuid === 'string' ? alert.uuid : null,
             scenario,
@@ -694,7 +706,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
             decision_count: Array.isArray(alert.decisions) ? alert.decisions.length : 0,
             filters: toMetaRecord(config.filters),
           },
-        });
+        }, [instanceId]));
       }
     }
 
@@ -703,14 +715,15 @@ export function createNotificationService(options: NotificationServiceOptions): 
         const createdAt = String(decision.created_at || '');
 
         const decisionId = String(decision.id);
+        const instanceId = String(decision.instance_id || 'default');
         const value = String(decision.value || '—');
         const decisionType = String(decision.type || decision.action || '—');
         const scenario = String(decision.scenario || decision.reason || '—');
         const target = String(decision.target || '—');
         const stopAt = String(decision.stop_at || '—');
 
-        candidates.push({
-          dedupeKey: `new-decision:${encodeURIComponent(decisionId)}`,
+        candidates.push(withInstanceContext({
+          dedupeKey: `${instanceAware ? `${encodeURIComponent(instanceId)}:` : ''}new-decision:${encodeURIComponent(decisionId)}`,
           title: t('server.notifications.newEvent.decisionTitle', { ruleName: rule.name }),
           message: t('server.notifications.newEvent.decisionMessage', {
             id: decisionId,
@@ -724,6 +737,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
           incidentStartedAt: createdAt,
           metadata: {
             event_type: 'decision',
+            instance_id: instanceId,
             decision_id: decisionId,
             alert_id: typeof decision.alert_id === 'string' || typeof decision.alert_id === 'number' ? decision.alert_id : null,
             type: decisionType,
@@ -736,7 +750,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
             simulated: decision.simulated === true,
             filters: toMetaRecord(config.filters),
           },
-        });
+        }, [instanceId]));
       }
     }
 
@@ -768,7 +782,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
         continue;
       }
 
-      candidates.push({
+      candidates.push(withInstanceContext({
         dedupeKey: `cve:${cveId}`,
         title: t('server.notifications.newCve.title', { ruleName: rule.name }),
         message: t('server.notifications.newCve.message', {
@@ -783,7 +797,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
           matched_alerts: matchedAlerts.length,
           filters: toMetaRecord(config.filters),
         },
-      });
+      }, matchedAlerts.map((alert) => String(alert.instance_id || 'default'))));
     }
 
     return candidates;
@@ -803,8 +817,8 @@ export function createNotificationService(options: NotificationServiceOptions): 
         const target = typeof decision.target === 'string' ? decision.target : null;
         const alertId = typeof decision.alert_id === 'string' || typeof decision.alert_id === 'number' ? decision.alert_id : null;
 
-        return {
-          dedupeKey: buildIpBanDedupeKey(decision),
+        return withInstanceContext({
+          dedupeKey: buildIpBanDedupeKey(decision, instanceAware),
           title: t('server.notifications.ipBan.title', { ruleName: rule.name }),
           message: t('server.notifications.ipBan.message', {
             value,
@@ -824,7 +838,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
             stop_at: stopAt,
             filters: toMetaRecord(config.filters),
           },
-        } satisfies NotificationCandidate;
+        }, [String(decision.instance_id || 'default')]);
       });
   }
 
@@ -856,86 +870,123 @@ export function createNotificationService(options: NotificationServiceOptions): 
   }
 
   async function evaluateLapiAvailabilityRule(rule: NotificationRule, now: Date, t: Translator): Promise<NotificationCandidate[]> {
-    if (!getLapiStatus) {
+    if (!getLapiStatus && !getLapiStatuses) {
       return [];
     }
 
-    const status = getLapiStatus();
     const config = normalizeRuleConfig('lapi-availability', rule.config);
     const candidates: NotificationCandidate[] = [];
     const activeIncidents = loadActiveIncidents(rule.id);
-    const activeOutageIncident = activeIncidents.get('lapi-availability:offline');
-
-    if (!status.isConnected && status.offline_since) {
-      const offlineSince = new Date(status.offline_since);
-      const outageDurationSeconds = Math.max(0, Math.floor((now.getTime() - offlineSince.getTime()) / 1_000));
-
-      if (outageDurationSeconds >= config.outage_threshold_seconds) {
-        candidates.push({
-          dedupeKey: 'lapi-availability:offline',
-          title: t('server.notifications.lapiUnavailable.title', { ruleName: rule.name }),
-          message: t('server.notifications.lapiUnavailable.message', { seconds: outageDurationSeconds }),
-          incidentStartedAt: status.offline_since,
+    const statuses = getLapiStatuses?.() || [{ instanceId: 'default', instanceName: 'CrowdSec', status: getLapiStatus!() }];
+    for (const { instanceId, instanceName, status } of statuses) {
+      const incidentPrefix = getLapiStatuses ? `${encodeURIComponent(instanceId)}:lapi-availability` : 'lapi-availability';
+      const activeOutageIncident = activeIncidents.get(`${incidentPrefix}:offline`);
+      if (!status.isConnected && status.offline_since) {
+        const outageDurationSeconds = Math.max(0, Math.floor((now.getTime() - new Date(status.offline_since).getTime()) / 1_000));
+        if (outageDurationSeconds >= config.outage_threshold_seconds) {
+          candidates.push(withInstanceContext({
+            dedupeKey: `${incidentPrefix}:offline`,
+            title: t('server.notifications.lapiUnavailable.title', { ruleName: rule.name }),
+            message: t('server.notifications.lapiUnavailable.message', { seconds: outageDurationSeconds }),
+            incidentStartedAt: status.offline_since,
+            metadata: {
+              instance_id: instanceId,
+              instance_name: instanceName,
+              offline_since: status.offline_since,
+              last_check: status.lastCheck,
+              last_error: status.lastError,
+              outage_threshold_seconds: config.outage_threshold_seconds,
+              outage_duration_seconds: outageDurationSeconds,
+            },
+          }, [{ id: instanceId, name: instanceName }]));
+        }
+        continue;
+      }
+      if (status.isConnected && config.notify_on_recovery && activeOutageIncident) {
+        const recoveredAt = now.toISOString();
+        const outageDurationSeconds = Math.max(0, Math.floor((now.getTime() - new Date(activeOutageIncident.firstSeenAt).getTime()) / 1_000));
+        candidates.push(withInstanceContext({
+          dedupeKey: `${incidentPrefix}:recovery:${recoveredAt}`,
+          title: t('server.notifications.lapiRecovered.title', { ruleName: rule.name }),
+          message: t('server.notifications.lapiRecovered.message', { seconds: outageDurationSeconds }),
           metadata: {
-            offline_since: status.offline_since,
+            instance_id: instanceId,
+            instance_name: instanceName,
+            offline_since: activeOutageIncident.firstSeenAt,
+            recovered_at: recoveredAt,
             last_check: status.lastCheck,
             last_error: status.lastError,
             outage_threshold_seconds: config.outage_threshold_seconds,
             outage_duration_seconds: outageDurationSeconds,
           },
-        });
+          severity: 'info',
+        }, [{ id: instanceId, name: instanceName }]));
       }
-
-      return candidates;
-    }
-
-    if (status.isConnected && config.notify_on_recovery && activeOutageIncident) {
-      const recoveredAt = now.toISOString();
-      const offlineSince = activeOutageIncident.firstSeenAt;
-      const outageDurationSeconds = Math.max(
-        0,
-        Math.floor((now.getTime() - new Date(offlineSince).getTime()) / 1_000),
-      );
-      candidates.push({
-        dedupeKey: `lapi-availability:recovery:${recoveredAt}`,
-        title: t('server.notifications.lapiRecovered.title', { ruleName: rule.name }),
-        message: t('server.notifications.lapiRecovered.message', { seconds: outageDurationSeconds }),
-        metadata: {
-          offline_since: offlineSince,
-          recovered_at: recoveredAt,
-          last_check: status.lastCheck,
-          last_error: status.lastError,
-          outage_threshold_seconds: config.outage_threshold_seconds,
-          outage_duration_seconds: outageDurationSeconds,
-        },
-        severity: 'info',
-      });
     }
 
     return candidates;
   }
 
-  async function countAlertsBetween(start: Date, end: Date, filters?: NotificationFilter): Promise<number> {
+  async function countAlertsByInstanceBetween(start: Date, end: Date, filters?: NotificationFilter): Promise<Map<string, number>> {
     const condition = buildNotificationDataCondition('alerts', start, end, filters);
-    const row = await queryWorker.get<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM alerts WHERE ${condition.sql}`,
+    const rows = await queryWorker.all<{ instance_id: string; count: number }>(
+      `SELECT instance_id, COUNT(*) AS count FROM alerts WHERE ${condition.sql} GROUP BY instance_id`,
       condition.params,
     );
-    return Number(row?.count || 0);
+    return new Map(rows.map((row) => [String(row.instance_id || 'default'), Number(row.count || 0)]));
+  }
+
+  function sumCounts(counts: Map<string, number>): number {
+    return [...counts.values()].reduce((total, count) => total + count, 0);
+  }
+
+  function withInstanceContext(
+    candidate: NotificationCandidate,
+    instances: Array<string | { id: string; name: string }>,
+  ): NotificationCandidate {
+    if (!instanceAware) {
+      return candidate;
+    }
+
+    const namesById = new Map<string, string>();
+    for (const instance of instances) {
+      const id = typeof instance === 'string' ? instance : instance.id;
+      const name = typeof instance === 'string' ? instanceNames.get(id) || id : instance.name;
+      if (!namesById.has(id)) namesById.set(id, name);
+    }
+    const orderedInstances = [...namesById.entries()].sort(([leftId], [rightId]) => {
+      const leftOrder = instanceOrder.get(leftId) ?? Number.MAX_SAFE_INTEGER;
+      const rightOrder = instanceOrder.get(rightId) ?? Number.MAX_SAFE_INTEGER;
+      return leftOrder - rightOrder || leftId.localeCompare(rightId);
+    });
+    if (orderedInstances.length === 0) {
+      return candidate;
+    }
+    const ids = orderedInstances.map(([id]) => id);
+    const names = orderedInstances.map(([, name]) => name);
+    const metadata = ids.length === 1
+      ? { ...candidate.metadata, instance_id: ids[0], instance_name: names[0] }
+      : { ...candidate.metadata, instance_ids: ids, instance_names: names };
+
+    return {
+      ...candidate,
+      title: `[${names.join(', ')}] ${candidate.title}`,
+      metadata,
+    };
   }
 
   async function getAlertsBetween(start: Date, end: Date, filters?: NotificationFilter): Promise<AlertRecord[]> {
     const condition = buildNotificationDataCondition('alerts', start, end, filters);
     const alerts: AlertRecord[] = [];
-    let lastId = 0;
+    let lastId: number | null = null;
     while (true) {
-      const rows = await queryWorker.all<NormalizedAlertRow>(`
+      const rows: NormalizedAlertRow[] = await queryWorker.all<NormalizedAlertRow>(`
         SELECT ${ALERT_RECORD_COLUMNS}
         FROM alerts
-        WHERE ${condition.sql} AND id > ?
+        WHERE ${condition.sql}${lastId === null ? '' : ' AND id > ?'}
         ORDER BY id ASC
         LIMIT 1000
-      `, [...condition.params, lastId]);
+      `, lastId === null ? condition.params : [...condition.params, lastId]);
       if (rows.length === 0) break;
       for (const row of rows) {
         const alert = alertFromRow(row);
@@ -1242,9 +1293,10 @@ function normalizeDecisionType(decision: AlertDecision & Record<string, unknown>
   return String(decision.type || decision.action || '').trim().toLowerCase();
 }
 
-function buildIpBanDedupeKey(decision: AlertDecision & Record<string, unknown>): string {
+function buildIpBanDedupeKey(decision: AlertDecision & Record<string, unknown>, instanceAware = false): string {
   return [
     'ip-ban',
+    ...(instanceAware ? [String(decision.instance_id || 'default')] : []),
     String(decision.value || '').trim().toLowerCase(),
     String(decision.origin || '').trim().toLowerCase(),
     String(decision.scenario || '').trim().toLowerCase(),

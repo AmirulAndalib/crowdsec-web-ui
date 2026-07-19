@@ -1,6 +1,15 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { createCrowdsecAuthConfig, type CrowdsecAuthConfig } from './auth';
+import {
+  DEPRECATED_CONFIG_ENV,
+  generateApplicationConfig,
+  loadApplicationConfig,
+  saveApplicationConfig,
+  type ParsedConfigFile,
+} from './config-file';
 import { resolveSecretEnv } from './env-secrets';
+import { hasLegacyConnectionEnvironment, loadInstancesConfig, type CrowdsecInstanceConfig } from './instances-config';
 
 export type AlertFilterMode = 'default' | 'new' | 'legacy';
 export type TimeFormat = 'browser' | '12h' | '24h';
@@ -77,6 +86,7 @@ export interface RuntimeConfig {
   timeFormat: TimeFormat;
   readOnly: boolean;
   dashboardAuth: DashboardAuthConfig;
+  instances: CrowdsecInstanceConfig[];
 }
 
 export function parseTimeZone(value: string | undefined): string | null {
@@ -112,10 +122,11 @@ export function parseRefreshInterval(intervalStr: string | undefined | null): nu
 
   if (str === 'manual' || str === '0') return 0;
 
-  const match = str.match(/^(\d+)([smhd])$/);
+  const match = str.match(/^(\d+)(ms|[smhd])$/);
   if (match) {
     const value = Number.parseInt(match[1], 10);
     const unit = match[2];
+    if (unit === 'ms') return value;
     if (unit === 's') return value * 1_000;
     if (unit === 'm') return value * 60_000;
     if (unit === 'h') return value * 3_600_000;
@@ -285,12 +296,6 @@ function parseAlertFilterConfig(env: NodeJS.ProcessEnv): Pick<
   const legacyAlertOrigins = parseCsvEnv(env.CROWDSEC_ALERT_ORIGINS);
   const legacyAlertExtraScenarios = parseCsvEnv(env.CROWDSEC_ALERT_EXTRA_SCENARIOS);
 
-  if (hasNewAlertFilters && hasLegacyAlertFilters) {
-    console.warn(
-      'Both new and deprecated CrowdSec alert filter environment variables are set. Using CROWDSEC_ALERT_INCLUDE_ORIGINS/CROWDSEC_ALERT_EXCLUDE_ORIGINS/CROWDSEC_ALERT_INCLUDE_CAPI/CROWDSEC_ALERT_INCLUDE_ORIGIN_EMPTY/CROWDSEC_ALERT_EXCLUDE_ORIGIN_EMPTY.',
-    );
-  }
-
   if (hasNewAlertFilters) {
     return {
       alertFilterMode: 'new',
@@ -305,10 +310,6 @@ function parseAlertFilterConfig(env: NodeJS.ProcessEnv): Pick<
   }
 
   if (hasLegacyAlertFilters) {
-    console.warn(
-      'CROWDSEC_ALERT_ORIGINS and CROWDSEC_ALERT_EXTRA_SCENARIOS are deprecated. Please migrate to CROWDSEC_ALERT_INCLUDE_ORIGINS/CROWDSEC_ALERT_EXCLUDE_ORIGINS/CROWDSEC_ALERT_INCLUDE_CAPI/CROWDSEC_ALERT_INCLUDE_ORIGIN_EMPTY/CROWDSEC_ALERT_EXCLUDE_ORIGIN_EMPTY.',
-    );
-
     const alertIncludeOrigins: string[] = [];
     let alertIncludeCapi = false;
 
@@ -360,7 +361,7 @@ function warnRemovedColumnVisibilityEnv(env: NodeJS.ProcessEnv): void {
   );
 }
 
-export function createRuntimeConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
+function createRuntimeConfigFromEnvironment(env: NodeJS.ProcessEnv): RuntimeConfig {
   const lookbackPeriod = env.CROWDSEC_LOOKBACK_PERIOD || '168h';
   const refreshIntervalMs = parseRefreshInterval(env.CROWDSEC_REFRESH_INTERVAL || '1m');
   const crowdsecAuth = createCrowdsecAuthConfig(env);
@@ -368,7 +369,7 @@ export function createRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runti
   const alertFilterConfig = parseAlertFilterConfig(env);
   warnRemovedColumnVisibilityEnv(env);
 
-  return {
+  const runtimeConfig: RuntimeConfig = {
     port: Number(env.PORT || 3000),
     basePath: (env.BASE_PATH || '').replace(/\/$/, ''),
     crowdsecUrl: env.CROWDSEC_URL || 'http://crowdsec:8080',
@@ -418,5 +419,108 @@ export function createRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runti
     timeFormat: parseTimeFormat(resolveRenamedEnv(env, 'TIME_FORMAT', 'CROWDSEC_TIME_FORMAT')),
     readOnly: parseBooleanEnv(env.PERMISSION_READ_ONLY, false),
     dashboardAuth: parseDashboardAuthConfig(env),
+    instances: [],
   };
+
+  const instancesFile = env.CROWDSEC_INSTANCES_CONFIG_FILE?.trim();
+  if (instancesFile) {
+    const legacyVariables = hasLegacyConnectionEnvironment(env);
+    if (legacyVariables.length > 0) {
+      throw new Error(`Configuration error: CROWDSEC_INSTANCES_CONFIG_FILE cannot be combined with legacy connection variables: ${legacyVariables.join(', ')}.`);
+    }
+    runtimeConfig.instances = loadInstancesConfig(instancesFile, env);
+  } else {
+    runtimeConfig.instances = [{
+      id: 'default',
+      name: env.CROWDSEC_INSTANCE_NAME?.trim() || 'CrowdSec',
+      icon: env.CROWDSEC_INSTANCE_ICON?.trim() || undefined,
+      lapiUrl: runtimeConfig.crowdsecUrl,
+      lapiAuth: runtimeConfig.crowdsecAuth,
+      lapiTls: {
+        caFile: runtimeConfig.crowdsecTlsCaCertPath,
+        certFile: runtimeConfig.crowdsecTlsCertPath,
+        keyFile: runtimeConfig.crowdsecTlsKeyPath,
+      },
+      prometheus: runtimeConfig.prometheusUrl ? [{
+        id: 'default',
+        name: 'CrowdSec',
+        url: runtimeConfig.prometheusUrl,
+        auth: { type: 'none' },
+        tls: {},
+        requestTimeoutMs: runtimeConfig.prometheusRequestTimeoutMs,
+      }] : [],
+      sync: {},
+    }];
+  }
+
+  return runtimeConfig;
+}
+
+function configuredDeprecatedEnvironment(env: NodeJS.ProcessEnv): string[] {
+  return DEPRECATED_CONFIG_ENV.filter((name) => Object.prototype.hasOwnProperty.call(env, name));
+}
+
+function warnDeprecatedEnvironment(
+  env: NodeJS.ProcessEnv,
+  options: { configFile: string; migrated: boolean },
+): void {
+  const names = configuredDeprecatedEnvironment(env);
+  if (names.length === 0) return;
+  console.warn(
+    `Deprecated environment-based settings detected: ${names.join(', ')}. `
+    + (options.migrated
+      ? `They were migrated into the generated YAML at "${options.configFile}". `
+        + 'This YAML is now authoritative; these variables no longer affect application settings and can be removed.'
+      : `The application YAML at "${options.configFile}" takes precedence; `
+        + 'these variables do not affect application settings and can be removed.'),
+  );
+}
+
+function createRuntimeConfigFromParsedConfig(parsed: ParsedConfigFile): RuntimeConfig {
+  const runtimeConfig = createRuntimeConfigFromEnvironment(parsed.environment);
+  runtimeConfig.instances = parsed.instances;
+  const primaryInstance = parsed.instances[0];
+  runtimeConfig.crowdsecUrl = primaryInstance.lapiUrl;
+  runtimeConfig.crowdsecAuth = primaryInstance.lapiAuth.mode === 'mtls'
+    ? { ...primaryInstance.lapiAuth, caCertPath: primaryInstance.lapiTls.caFile }
+    : primaryInstance.lapiAuth;
+  runtimeConfig.crowdsecAuthMode = primaryInstance.lapiAuth.mode;
+  runtimeConfig.crowdsecTlsCertPath = primaryInstance.lapiTls.certFile;
+  runtimeConfig.crowdsecTlsKeyPath = primaryInstance.lapiTls.keyFile;
+  runtimeConfig.crowdsecTlsCaCertPath = primaryInstance.lapiTls.caFile;
+  runtimeConfig.prometheusUrl = primaryInstance.prometheus[0]?.url;
+  if (parsed.updateCheckEnabled !== undefined) runtimeConfig.updateCheckEnabled = parsed.updateCheckEnabled;
+  return runtimeConfig;
+}
+
+export interface RuntimeConfigOptions {
+  defaultConfigFile?: string;
+}
+
+function defaultApplicationConfigFile(): string {
+  const dockerDataDir = '/app/data';
+  const dataDir = fs.existsSync(dockerDataDir) ? dockerDataDir : path.resolve(process.cwd(), 'data');
+  return path.join(dataDir, 'config.yaml');
+}
+
+export function createRuntimeConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: RuntimeConfigOptions = {},
+): RuntimeConfig {
+  const explicitConfigFile = env.CONFIG_FILE?.trim() || undefined;
+  const defaultConfigFile = options.defaultConfigFile || defaultApplicationConfigFile();
+  const configFile = explicitConfigFile || defaultConfigFile;
+  let migrated = false;
+
+  if (!explicitConfigFile && !fs.existsSync(configFile)) {
+    const legacyConfig = createRuntimeConfigFromEnvironment(env);
+    const generatedConfig = generateApplicationConfig(env, legacyConfig);
+    migrated = saveApplicationConfig(configFile, generatedConfig);
+    if (migrated) console.log(`Saved generated legacy configuration to ${configFile}.`);
+  }
+
+  warnDeprecatedEnvironment(env, { configFile, migrated });
+  const runtimeConfig = createRuntimeConfigFromParsedConfig(loadApplicationConfig(configFile, env));
+  console.log(`Loaded application configuration from ${configFile}.`);
+  return runtimeConfig;
 }
