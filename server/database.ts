@@ -52,6 +52,7 @@ const SYNC_SECONDARY_INDEX_NAMES = [
   'idx_alerts_simulated_created_at',
   'idx_alerts_country_created_at',
   'idx_alerts_scenario_created_at',
+  'idx_alerts_filters',
   'idx_alerts_instance_created',
   'idx_decisions_stop_at',
   'idx_decisions_alert_summary',
@@ -90,6 +91,10 @@ const CREATE_SYNC_SECONDARY_INDEXES_SQL = `
   CREATE INDEX IF NOT EXISTS idx_alerts_simulated_created_at ON alerts(simulated, created_at DESC, id DESC);
   CREATE INDEX IF NOT EXISTS idx_alerts_country_created_at ON alerts(country, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_alerts_scenario_created_at ON alerts(scenario, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_alerts_filters ON alerts(
+    instance_id, country, scenario, as_name, source_ip, target, country_name,
+    region, city, machine, origins, message, upstream_id, simulated, created_at DESC, id DESC
+  );
   CREATE INDEX IF NOT EXISTS idx_alerts_instance_created ON alerts(instance_id, created_at DESC, id DESC);
   CREATE INDEX IF NOT EXISTS idx_decisions_stop_at ON decisions(stop_at);
   CREATE INDEX IF NOT EXISTS idx_decisions_alert_summary ON decisions(alert_id, origin, simulated, stop_at);
@@ -2535,6 +2540,7 @@ function initSchema(db: Database, freshDatabase: boolean): boolean {
   migrateRecordIndexColumns(db);
   migrateNormalizedDecisionPayloads(db);
   migrateNormalizedAlertPayloads(db);
+  migrateAlertContextSearch(db);
   initDecisionDuplicateDirtyTracking(db);
   migrateNotificationRulesTable(db, createNotificationRulesTable);
   migrateNotificationsTable(db, createNotificationsTable);
@@ -2892,6 +2898,60 @@ function migrateNormalizedAlertPayloads(db: Database): void {
     rows = selectRows.all() as typeof rows;
   }
   db.query('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(migrationKey, '1');
+}
+
+function migrateAlertContextSearch(db: Database): void {
+  const migrationKey = 'alert_context_search_version';
+  const currentVersion = db.query('SELECT value FROM meta WHERE key = ?').get(migrationKey) as MetaRow | null;
+  if (currentVersion?.value === '1') return;
+
+  const selectRows = db.query(`
+    SELECT ${ALERT_RECORD_COLUMNS}
+    FROM alerts
+    WHERE CASE
+      WHEN json_valid(extra_data) THEN json_type(extra_data, '$.meta')
+      ELSE NULL
+    END = 'array'
+    ORDER BY alerts.id
+    LIMIT 500 OFFSET ?
+  `);
+  const update = db.query(`
+    UPDATE alerts
+    SET meta_search = $meta_search,
+        search_text = $search_text
+    WHERE id = $id
+  `);
+
+  const migrateBatch = db.transaction((items: NormalizedAlertRow[]) => {
+    for (const row of items) {
+      const alert = alertFromRow(row);
+      const index = deriveAlertIndexValuesFromRecord(alert, {
+        createdAt: alert.created_at,
+        scenario: typeof alert.scenario === 'string' ? alert.scenario : null,
+        sourceIp: typeof alert.source?.ip === 'string' ? alert.source.ip : null,
+        message: typeof alert.message === 'string' ? alert.message : null,
+      });
+      update.run({
+        $id: row.internal_id ?? row.id,
+        $meta_search: index.metaSearch,
+        $search_text: index.searchText,
+      });
+    }
+  });
+
+  let migratedRows = 0;
+  while (true) {
+    const rows = selectRows.all(migratedRows) as NormalizedAlertRow[];
+    if (rows.length === 0) break;
+    migrateBatch(rows);
+    migratedRows += rows.length;
+  }
+
+  const finishMigration = db.transaction(() => {
+    db.query('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(migrationKey, '1');
+    if (migratedRows > 0) db.exec('DROP TABLE IF EXISTS alerts_fts');
+  });
+  finishMigration();
 }
 
 function backfillAlertLocationColumns(db: Database): void {

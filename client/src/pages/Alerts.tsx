@@ -6,21 +6,36 @@ import { useRefresh } from "../contexts/useRefresh";
 import { Badge } from "../components/ui/Badge";
 import { Modal } from "../components/ui/Modal";
 import { HighlightedSearchInput } from "../components/HighlightedSearchInput";
+import { CollapsibleSearchControls } from "../components/CollapsibleSearchControls";
 import { SearchSyntaxModal } from "../components/SearchSyntaxModal";
 import { TableColumnsModal } from "../components/TableColumnsModal";
+import { QuickFilters, type QuickFilterDefinition, type QuickFilterSectionId } from "../components/QuickFilters";
 import { CountryFlag } from "../components/CountryFlag";
 import { ScenarioName } from "../components/ScenarioName";
 import { TimeDisplay } from "../components/TimeDisplay";
 import { EventCard } from "../components/EventCard";
+import { ContextSummary } from "../components/ContextSummary";
+import { Collapsible } from "../components/ui/Collapsible";
+import { getDisplayMetadata, isAppSecEvent } from "../lib/alertMetadata";
 import { getCountryName } from "../lib/utils";
 import { getDecisionExpirationState } from "../lib/decisionExpiration";
 import { loadStoredTableColumnPreferences, saveStoredTableColumnPreferences } from "../lib/tableColumns";
 import { TABLE_COLUMN_DEFINITIONS } from "../../../shared/contracts";
 import { resolveMachineName } from "../../../shared/machine";
 import { collectDistinctOrigins, getOriginDisplayValue, getOriginTitle } from "../../../shared/origin";
-import { compileAlertSearch, getSearchHelpDefinition, type SearchParseError } from "../../../shared/search";
+import {
+    compileAlertSearch,
+    getSearchDateRange,
+    getSearchHelpDefinition,
+    replaceSearchDateRange,
+    replaceSearchFacetSelection,
+    serializeSearchNode,
+    type SearchFacetSelection,
+    type SearchDateRange,
+    type SearchParseError,
+} from "../../../shared/search";
 import { Info, ExternalLink, Shield, ShieldBan, Trash2, X, AlertCircle, Columns3, Loader2 } from "lucide-react";
-import type { AlertRecord, AlertSource, ApiPermissionError, BulkDeleteResult, DecisionListItem, InstanceEntityRef, InstanceOperationResult, SimulationFilter, SlimAlert, TableColumnId, TableColumnPreferences } from '../types';
+import type { AlertRecord, AlertSource, ApiPermissionError, BulkDeleteResult, DecisionListItem, FacetField, InstanceEntityRef, InstanceOperationResult, SimulationFilter, SlimAlert, TableColumnId, TableColumnPreferences } from '../types';
 import { useI18n, type I18nContextValue } from "../lib/i18n";
 import { getBrowserTimeZone, useDateTime } from "../lib/dateTime";
 
@@ -208,6 +223,7 @@ export function Alerts() {
     const { language, t } = useI18n();
     const { formatDateTime, timeZone } = useDateTime();
     const { refreshSignal } = useRefresh();
+    const [facetRefreshKey, setFacetRefreshKey] = useState(refreshSignal);
     const [searchParams, setSearchParams] = useSearchParams();
     const initialQueryParam = searchParams.get("q") ?? "";
     const [alerts, setAlerts] = useState<AlertListItem[]>([]);
@@ -256,6 +272,7 @@ export function Alerts() {
     const selectedAlertInstanceIdRef = useRef<string | undefined>(undefined);
 
     const PAGE_SIZE = 50;
+    const MAX_ALERT_REFRESH_SIZE = 200;
     const MAX_MODAL_DECISION_REFRESH_SIZE = 200;
     const hasMoreAlerts = currentPage < totalPages;
     const observer = useRef<IntersectionObserver | null>(null);
@@ -264,6 +281,7 @@ export function Alerts() {
     const selectAllAlertsRef = useRef<HTMLInputElement | null>(null);
     const previousSelectedAlertIdRef = useRef<string | null>(null);
     const modalSelectedAlertIdRef = useRef<string | null>(null);
+    const alertsRef = useRef<AlertListItem[]>([]);
     const currentPageRef = useRef(1);
     const inFlightLoadKeysRef = useRef(new Set<string>());
     const lastCompletedLoadRef = useRef<{ key: string; completedAt: number } | null>(null);
@@ -343,6 +361,111 @@ export function Alerts() {
         }
         return filters;
     }, [appliedQuery, currentSimulationFilter, dateEndParam, dateStartParam, searchParams]);
+    const facetFilters = useMemo(
+        () => buildServerFilters(currentSimulationFilter),
+        [buildServerFilters, currentSimulationFilter],
+    );
+    const quickFilterConfig = useMemo<{
+        fields: QuickFilterDefinition[];
+        sectionOrder: QuickFilterSectionId[];
+    }>(() => {
+        const fieldByColumn: Partial<Record<TableColumnId, FacetField>> = {
+            id: 'id',
+            instance: 'instance',
+            scenario: 'scenario',
+            country: 'country',
+            region: 'region',
+            city: 'city',
+            as: 'as',
+            source: 'ip',
+            machine: 'machine',
+            origin: 'origin',
+            decisions: 'decision',
+        };
+        const fields: QuickFilterDefinition[] = [];
+        const sectionOrder: QuickFilterSectionId[] = [];
+        for (const column of visibleAlertColumns) {
+            if (column === 'time') {
+                sectionOrder.push('date');
+                continue;
+            }
+            const field = fieldByColumn[column];
+            if (!field) continue;
+            fields.push({ field, label: t(`tableColumns.${column}`) });
+            sectionOrder.push(field);
+        }
+        fields.push({ field: 'target', label: t('components.eventCard.target') });
+        sectionOrder.push('target');
+        return { fields, sectionOrder };
+    }, [t, visibleAlertColumns]);
+    const quickFilterDateRange = useMemo(() => {
+        const range = compiledSearch.ok ? getSearchDateRange(compiledSearch.ast) : { start: '', end: '' };
+        return {
+            start: range.start || dateStartParam,
+            end: range.end || dateEndParam,
+        };
+    }, [compiledSearch, dateEndParam, dateStartParam]);
+    const applyFacetSelection = useCallback((field: FacetField, selection: SearchFacetSelection) => {
+        const currentQuery = searchParams.get('q') ?? '';
+        const currentSearch = compileAlertSearch(currentQuery, searchValidationFeatures, searchDateOptions);
+        if (!currentSearch.ok) return;
+
+        const nextQuery = serializeSearchNode(replaceSearchFacetSelection(
+            currentSearch.ast,
+            field,
+            selection,
+        ));
+        const nextParams = new URLSearchParams(searchParams);
+        if (nextQuery) nextParams.set('q', nextQuery);
+        else nextParams.delete('q');
+
+        cancelSearchDebounce();
+        searchDraftRef.current = nextQuery;
+        searchSelectionRef.current = { start: nextQuery.length, end: nextQuery.length };
+        skipSearchParamSyncRef.current = nextQuery;
+        setSearchDraft(nextQuery);
+        setDebouncedSearchDraft(nextQuery);
+        setSearchParams(nextParams);
+    }, [
+        cancelSearchDebounce,
+        searchDateOptions,
+        searchParams,
+        searchValidationFeatures,
+        setSearchParams,
+    ]);
+    const applyDateRange = useCallback((range: SearchDateRange) => {
+        const currentQuery = searchParams.get('q') ?? '';
+        const currentSearch = compileAlertSearch(currentQuery, searchValidationFeatures, searchDateOptions);
+        if (!currentSearch.ok) return;
+
+        const nextQuery = serializeSearchNode(replaceSearchDateRange(currentSearch.ast, range));
+        const nextParams = new URLSearchParams(searchParams);
+        nextParams.delete('dateStart');
+        nextParams.delete('dateEnd');
+        if (nextQuery) nextParams.set('q', nextQuery);
+        else nextParams.delete('q');
+
+        cancelSearchDebounce();
+        searchDraftRef.current = nextQuery;
+        searchSelectionRef.current = { start: nextQuery.length, end: nextQuery.length };
+        skipSearchParamSyncRef.current = nextQuery;
+        setSearchDraft(nextQuery);
+        setDebouncedSearchDraft(nextQuery);
+        setSearchParams(nextParams);
+    }, [
+        cancelSearchDebounce,
+        searchDateOptions,
+        searchParams,
+        searchValidationFeatures,
+        setSearchParams,
+    ]);
+    const formatFacetValue = useCallback((field: FacetField, value: string) => {
+        if (field === 'country') return getCountryName(value, language) || value;
+        if (field === 'decision') {
+            return value === 'active' ? t('common.active') : t('common.inactive');
+        }
+        return value;
+    }, [language, t]);
 
     const loadConfig = useCallback(async (refresh = false) => {
         if (!refresh && configRef.current) {
@@ -423,34 +546,39 @@ export function Alerts() {
                 ? parseSimulationFilter(searchParams.get("simulation"))
                 : 'all';
             const filters = buildServerFilters(requestedSimulationFilter);
-            const alertsResult = await fetchAlertsPaginated(page, PAGE_SIZE, filters);
+            const loadedPageCount = Math.max(1, currentPageRef.current);
+            const requestedPageSize = !append && preserveLoadedPages
+                ? Math.min(MAX_ALERT_REFRESH_SIZE, loadedPageCount * PAGE_SIZE)
+                : PAGE_SIZE;
+            const alertsResult = await fetchAlertsPaginated(page, requestedPageSize, filters);
             let alertsData = alertsResult.data;
             let nextPage = alertsResult.pagination.page;
+            const totalPagesAtDefaultSize = Math.ceil(alertsResult.pagination.total / PAGE_SIZE);
 
             if (!append && preserveLoadedPages) {
-                const loadedPageCount = Math.max(1, currentPageRef.current);
-                const maxPageToRefresh = Math.max(1, Math.min(loadedPageCount, alertsResult.pagination.total_pages || 1));
-                if (maxPageToRefresh > 1) {
-                    const remainingPages = await Promise.all(
-                        Array.from({ length: maxPageToRefresh - 1 }, (_, index) =>
-                            fetchAlertsPaginated(index + 2, PAGE_SIZE, filters),
-                        ),
-                    );
-                    alertsData = [alertsResult, ...remainingPages].flatMap((result) => result.data);
-                }
-                nextPage = maxPageToRefresh;
+                nextPage = Math.max(1, Math.min(loadedPageCount, totalPagesAtDefaultSize || 1));
+                const refreshedAlertKeys = new Set(alertsData.map(alertKey));
+                const visibleAlertCount = Math.min(
+                    alertsResult.pagination.total,
+                    nextPage * PAGE_SIZE,
+                );
+                alertsData = [
+                    ...alertsData,
+                    ...alertsRef.current.filter((alert) => !refreshedAlertKeys.has(alertKey(alert))),
+                ].slice(0, visibleAlertCount);
+            } else if (append) {
+                alertsData = [...alertsRef.current, ...alertsData];
             }
 
-            setAlerts((current) => append ? [...current, ...alertsData] : alertsData);
+            alertsRef.current = alertsData;
+            setAlerts(alertsData);
             currentPageRef.current = append ? alertsResult.pagination.page : nextPage;
             setCurrentPage(currentPageRef.current);
-            setTotalPages(alertsResult.pagination.total_pages);
+            setTotalPages(totalPagesAtDefaultSize);
             setTotalAlerts(alertsResult.pagination.total);
             setTotalUnfilteredAlerts(alertsResult.pagination.unfiltered_total);
             const nextSelectableIds = alertsData.map(alertKey);
-            setSelectableAlertIds((current) => append
-                ? Array.from(new Set([...current, ...nextSelectableIds]))
-                : nextSelectableIds);
+            setSelectableAlertIds(nextSelectableIds);
             if (!append) {
                 setSelectedAlertIds((current) => current.filter((id) => nextSelectableIds.includes(id)));
             }
@@ -542,7 +670,12 @@ export function Alerts() {
         }
 
         lastRefreshSignalRef.current = refreshSignal;
-        void loadAlertsRef.current({ isBackground: true, page: 1, preserveLoadedPages: true, refreshConfig: true });
+        void loadAlertsRef.current({
+            isBackground: true,
+            page: 1,
+            preserveLoadedPages: true,
+            refreshConfig: true,
+        }).finally(() => setFacetRefreshKey(refreshSignal));
     }, [refreshSignal]);
 
     useEffect(() => {
@@ -977,6 +1110,10 @@ export function Alerts() {
 
     const visibleAlerts = filteredAlerts;
     const selectedAlertEvents = selectedAlert && hasAlertEvents(selectedAlert) ? selectedAlert.events ?? [] : [];
+    const selectedAlertContext = selectedAlert && 'meta' in selectedAlert
+        ? getDisplayMetadata(selectedAlert.meta)
+        : [];
+    const selectedAlertIsAppSec = selectedAlertEvents.some(isAppSecEvent);
     const selectedAlertIsSimulated = selectedAlert ? isSimulatedAlert(selectedAlert) : false;
     const selectedAlertSourceValue = getAlertSourceValue(selectedAlert?.source);
     const alertSummaryGridColumns = multipleInstances
@@ -998,6 +1135,20 @@ export function Alerts() {
             ? t('pages.alerts.summaryFiltered', { count: visibleAlerts.length, total: totalAlerts, unfiltered: totalUnfilteredAlerts })
             : t('pages.alerts.summary', { count: visibleAlerts.length, total: totalAlerts });
     const tableBusy = initialLoading || backgroundLoading || loadingMore;
+
+    const quickFilterProps = {
+        page: 'alerts' as const,
+        fields: quickFilterConfig.fields,
+        sectionOrder: quickFilterConfig.sectionOrder,
+        filters: facetFilters,
+        searchAst: compiledSearch.ok ? compiledSearch.ast : null,
+        onSelectionChange: applyFacetSelection,
+        dateRange: quickFilterDateRange,
+        onDateRangeChange: applyDateRange,
+        formatValue: formatFacetValue,
+        busy: tableBusy,
+        refreshKey: facetRefreshKey,
+    };
 
     return (
         <div className="space-y-6">
@@ -1084,10 +1235,26 @@ export function Alerts() {
 
             <div className="space-y-2">
                 <div className="flex items-stretch gap-2">
-                    <div className="flex-1">
+                    <button
+                        type="button"
+                        onClick={() => setShowColumnsModal(true)}
+                        className="inline-flex items-center justify-center rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 text-gray-600 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
+                        aria-label={t('components.tableColumns.chooseAlertColumns')}
+                        title={t('components.tableColumns.chooseColumns')}
+                    >
+                        <Columns3 size={18} />
+                    </button>
+                    <QuickFilters {...quickFilterProps} />
+                    <CollapsibleSearchControls
+                        inputRef={searchInputRef}
+                        onHelp={() => setShowSearchSyntaxModal(true)}
+                    >
                         <HighlightedSearchInput
                             ref={searchInputRef}
                             searchPage="alerts"
+                            showSearchIcon={false}
+                            containerClassName="rounded-l-none"
+                            className="rounded-l-none"
                             searchFeatures={searchValidationFeatures}
                             placeholder={t('pages.alerts.filterPlaceholder')}
                             value={searchDraft}
@@ -1103,25 +1270,7 @@ export function Alerts() {
                             aria-invalid={queryError ? 'true' : 'false'}
                             aria-describedby={queryError ? 'alerts-search-error' : undefined}
                         />
-                    </div>
-                    <button
-                        type="button"
-                        onClick={() => setShowSearchSyntaxModal(true)}
-                        className="inline-flex items-center justify-center rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 text-gray-600 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
-                        aria-label={t('components.searchSyntax.help')}
-                        title={t('components.searchSyntax.help')}
-                    >
-                        <Info size={18} />
-                    </button>
-                    <button
-                        type="button"
-                        onClick={() => setShowColumnsModal(true)}
-                        className="inline-flex items-center justify-center rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 text-gray-600 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
-                        aria-label={t('components.tableColumns.chooseAlertColumns')}
-                        title={t('components.tableColumns.chooseColumns')}
-                    >
-                        <Columns3 size={18} />
-                    </button>
+                    </CollapsibleSearchControls>
                 </div>
                 {queryError && (
                     <p id="alerts-search-error" className="text-xs text-red-600 dark:text-red-400">
@@ -1489,13 +1638,25 @@ export function Alerts() {
                         </div>
 
                         {/* Message */}
-                        {selectedAlert.message && (
-                            <div className="p-4 bg-blue-50 dark:bg-blue-900/10 rounded-lg border border-blue-100 dark:border-blue-900/30">
+                        {(selectedAlert.message || selectedAlertIsAppSec) && (
+                            <div className={`rounded-lg border p-4 ${selectedAlertIsAppSec
+                                ? 'border-red-200 bg-red-50 dark:border-red-900/50 dark:bg-red-900/10'
+                                : 'border-blue-100 bg-blue-50 dark:border-blue-900/30 dark:bg-blue-900/10'
+                            }`}>
                                 <div className="flex items-start gap-2">
-                                    <Info size={18} className="text-blue-600 dark:text-blue-400 flex-shrink-0 mt-0.5" />
-                                    <div className="text-sm text-gray-900 dark:text-gray-100">
-                                        {selectedAlert.message}
-                                    </div>
+                                    {selectedAlertIsAppSec ? (
+                                        <Badge variant="danger" className="mt-0.5 shrink-0 gap-1">
+                                            <Shield size={12} />
+                                            AppSec / WAF
+                                        </Badge>
+                                    ) : (
+                                        <Info size={18} className="text-blue-600 dark:text-blue-400 flex-shrink-0 mt-0.5" />
+                                    )}
+                                    {selectedAlert.message && (
+                                        <div className="text-sm text-gray-900 dark:text-gray-100">
+                                            {selectedAlert.message}
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         )}
@@ -1594,32 +1755,48 @@ export function Alerts() {
                             </div>
                         )}
 
-                        {/* Events Breakdown */}
-                        <div>
-                            <h4 className="text-lg font-semibold text-gray-900 dark:text-white mb-3">
-                                {t('pages.alerts.eventsTitle', { count: selectedAlertEvents.length })}
-                            </h4>
-                            <div className="space-y-2">
-                                {(showAllEvents
-                                    ? selectedAlertEvents
-                                    : selectedAlertEvents.slice(0, 10)
-                                )?.map((event, idx) => (
-                                    <EventCard
-                                        key={idx}
-                                        event={event}
-                                        index={idx}
-                                    />
-                                ))}
+                        {/* Alert Context */}
+                        {selectedAlertContext.length > 0 && (
+                            <div>
+                                <h4 className="text-lg font-semibold text-gray-900 dark:text-white mb-3">
+                                    {t('pages.alerts.contextSummary')}
+                                </h4>
+                                <ContextSummary key={alertKey(selectedAlert)} entries={selectedAlertContext} />
                             </div>
-                            {!showAllEvents && selectedAlertEvents.length > 10 && (
-                                <button
-                                    onClick={() => setShowAllEvents(true)}
-                                    className="mt-3 w-full py-2 text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 bg-gray-50 dark:bg-gray-900/30 rounded border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors cursor-pointer"
-                                >
-                                    {t('pages.alerts.showAllEvents', { total: selectedAlertEvents.length, remaining: selectedAlertEvents.length - 10 })}
-                                </button>
-                            )}
-                        </div>
+                        )}
+
+                        {/* Events Breakdown */}
+                        <Collapsible
+                            trigger={
+                                <h4 className="text-lg font-semibold text-gray-900 dark:text-white">
+                                    {t('pages.alerts.eventsTitle', { count: selectedAlertEvents.length })}
+                                </h4>
+                            }
+                            defaultOpen={false}
+                        >
+                            <div className="mt-3">
+                                <div className="space-y-2">
+                                    {(showAllEvents
+                                        ? selectedAlertEvents
+                                        : selectedAlertEvents.slice(0, 10)
+                                    )?.map((event, idx) => (
+                                        <EventCard
+                                            key={idx}
+                                            event={event}
+                                            index={idx}
+                                        />
+                                    ))}
+                                </div>
+                                {!showAllEvents && selectedAlertEvents.length > 10 && (
+                                    <button
+                                        onClick={() => setShowAllEvents(true)}
+                                        className="mt-3 w-full py-2 text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 bg-gray-50 dark:bg-gray-900/30 rounded border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors cursor-pointer"
+                                    >
+                                        {t('pages.alerts.showAllEvents', { total: selectedAlertEvents.length, remaining: selectedAlertEvents.length - 10 })}
+                                    </button>
+                                )}
+                            </div>
+                        </Collapsible>
 
                     </div>
                 )}
