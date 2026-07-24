@@ -13,6 +13,7 @@ import { QuickFilters, type QuickFilterDefinition, type QuickFilterSectionId } f
 import { CountryFlag } from "../components/CountryFlag";
 import { ScenarioName } from "../components/ScenarioName";
 import { TimeDisplay } from "../components/TimeDisplay";
+import { TargetDisplay } from "../components/TargetDisplay";
 import { EventCard } from "../components/EventCard";
 import { ContextSummary } from "../components/ContextSummary";
 import { Collapsible } from "../components/ui/Collapsible";
@@ -378,6 +379,7 @@ export function Alerts() {
             city: 'city',
             as: 'as',
             source: 'ip',
+            target: 'target',
             machine: 'machine',
             origin: 'origin',
             decisions: 'decision',
@@ -394,8 +396,6 @@ export function Alerts() {
             fields.push({ field, label: t(`tableColumns.${column}`) });
             sectionOrder.push(field);
         }
-        fields.push({ field: 'target', label: t('components.eventCard.target') });
-        sectionOrder.push('target');
         return { fields, sectionOrder };
     }, [t, visibleAlertColumns]);
     const quickFilterDateRange = useMemo(() => {
@@ -1117,8 +1117,8 @@ export function Alerts() {
     const selectedAlertIsSimulated = selectedAlert ? isSimulatedAlert(selectedAlert) : false;
     const selectedAlertSourceValue = getAlertSourceValue(selectedAlert?.source);
     const alertSummaryGridColumns = multipleInstances
-        ? (isAlertColumnVisible('machine') ? 'md:grid-cols-5' : 'md:grid-cols-4')
-        : (isAlertColumnVisible('machine') ? 'md:grid-cols-4' : 'md:grid-cols-3');
+        ? (isAlertColumnVisible('machine') ? 'md:grid-cols-3 xl:grid-cols-6' : 'md:grid-cols-3 xl:grid-cols-5')
+        : (isAlertColumnVisible('machine') ? 'md:grid-cols-3 xl:grid-cols-5' : 'md:grid-cols-2 xl:grid-cols-4');
     const deleteActionTitle = pendingDeleteAction?.kind === "single"
         ? t('pages.alerts.deleteAlertTitle')
         : pendingDeleteAction?.kind === "selected"
@@ -1235,15 +1235,6 @@ export function Alerts() {
 
             <div className="space-y-2">
                 <div className="flex items-stretch gap-2">
-                    <button
-                        type="button"
-                        onClick={() => setShowColumnsModal(true)}
-                        className="inline-flex items-center justify-center rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 text-gray-600 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
-                        aria-label={t('components.tableColumns.chooseAlertColumns')}
-                        title={t('components.tableColumns.chooseColumns')}
-                    >
-                        <Columns3 size={18} />
-                    </button>
                     <QuickFilters {...quickFilterProps} />
                     <CollapsibleSearchControls
                         inputRef={searchInputRef}
@@ -1271,6 +1262,15 @@ export function Alerts() {
                             aria-describedby={queryError ? 'alerts-search-error' : undefined}
                         />
                     </CollapsibleSearchControls>
+                    <button
+                        type="button"
+                        onClick={() => setShowColumnsModal(true)}
+                        className="ml-auto inline-flex items-center justify-center rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 text-gray-600 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
+                        aria-label={t('components.tableColumns.chooseAlertColumns')}
+                        title={t('components.tableColumns.chooseColumns')}
+                    >
+                        <Columns3 size={18} />
+                    </button>
                 </div>
                 {queryError && (
                     <p id="alerts-search-error" className="text-xs text-red-600 dark:text-red-400">
@@ -1378,6 +1378,12 @@ export function Alerts() {
                                                                     showLink={true}
                                                                     simulated={simulationsEnabled && isSimulatedAlert(alert)}
                                                                 />
+                                                            </td>
+                                                        );
+                                                    case 'target':
+                                                        return (
+                                                            <td key={columnId} className="px-6 py-4 text-sm text-gray-900 dark:text-gray-100 max-w-[180px]">
+                                                                <TargetDisplay target={alert.target} targetCount={alert.target_count} />
                                                             </td>
                                                         );
                                                     case 'country':
@@ -1634,6 +1640,14 @@ export function Alerts() {
                                         <span>{selectedAlert.source.as_name}</span>
                                     )}
                                 </div>
+                            </div>
+                            <div className={ALERT_DETAIL_CARD_CLASS_NAME}>
+                                <h4 className={ALERT_DETAIL_LABEL_CLASS_NAME}>{t('tableColumns.target')}</h4>
+                                <TargetDisplay
+                                    target={selectedAlert.target}
+                                    targetCount={selectedAlert.target_count}
+                                    className={ALERT_DETAIL_PRIMARY_CLASS_NAME}
+                                />
                             </div>
                         </div>
 
