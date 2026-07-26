@@ -14,10 +14,26 @@ import { CountryFlag } from "../components/CountryFlag";
 import { ScenarioName } from "../components/ScenarioName";
 import { TimeDisplay } from "../components/TimeDisplay";
 import { TargetDisplay } from "../components/TargetDisplay";
-import { getCountryName } from "../lib/utils";
+import { getCountryCodesMatchingName, getCountryName } from "../lib/utils";
 import { getDecisionExpirationState } from "../lib/decisionExpiration";
 import { TABLE_COLUMN_DEFINITIONS } from "../../../shared/contracts";
-import { loadStoredTableColumnPreferences, saveStoredTableColumnPreferences } from "../lib/tableColumns";
+import {
+    loadStoredTableColumnOrders,
+    loadStoredTableColumnPreferences,
+    saveStoredTableColumnPreferences,
+} from "../lib/tableColumns";
+import {
+    DECISION_QUICK_FILTER_FIELDS,
+    emptyStoredQuickFilters,
+    getStoredQuickFilterSelection,
+    loadStoredQuickFilters,
+    mergeStoredQuickFiltersIntoQuery,
+    saveStoredQuickFilters,
+    setStoredQuickFilterSelection,
+    storedQuickFiltersEqual,
+    syncStoredQuickFiltersFromSearch,
+    type StoredQuickFilters,
+} from "../lib/quickFilters";
 import {
     compileDecisionSearch,
     getSearchDateRange,
@@ -152,11 +168,20 @@ export function Decisions() {
     const { refreshSignal } = useRefresh();
     const [facetRefreshKey, setFacetRefreshKey] = useState(refreshSignal);
     const [searchParams, setSearchParams] = useSearchParams();
-    const initialQueryParam = searchParams.get("q") ?? "";
+    const [persistedQuickFilters, setPersistedQuickFilters] = useState<StoredQuickFilters>(
+        () => loadStoredQuickFilters(),
+    );
+    const persistedQuickFiltersRef = useRef(persistedQuickFilters);
+    const [initialQueryParam] = useState(() => mergeStoredQuickFiltersIntoQuery(
+        'decisions',
+        searchParams.get("q") ?? "",
+        persistedQuickFilters,
+    ));
     const [decisions, setDecisions] = useState<DecisionListItem[]>([]);
     const [simulationsEnabled, setSimulationsEnabled] = useState(false);
     const [canManageEnforcement, setCanManageEnforcement] = useState(false);
     const [multipleInstances, setMultipleInstances] = useState(false);
+    const [instanceNames, setInstanceNames] = useState<Record<string, string>>({});
     const [tableColumnPreferences, setTableColumnPreferences] = useState<TableColumnPreferences>(() => loadStoredTableColumnPreferences());
     const [showColumnsModal, setShowColumnsModal] = useState(false);
     const [searchDraft, setSearchDraft] = useState(initialQueryParam);
@@ -185,7 +210,6 @@ export function Decisions() {
     const [retryDecisionInstances, setRetryDecisionInstances] = useState<InstanceOperationResult[]>([]);
     const alertIdFilter = searchParams.get("alert_id");
     const queryParam = searchParams.get("q");
-    const appliedQuery = queryParam?.trim() ?? "";
     const dateStartParam = searchParams.get("dateStart") ?? "";
     const dateEndParam = searchParams.get("dateEnd") ?? "";
     const includeExpiredParam = searchParams.get("include_expired") === "true";
@@ -213,6 +237,7 @@ export function Decisions() {
         simulationsEnabled: boolean;
         canManageEnforcement: boolean;
         multipleInstances: boolean;
+        instanceNames: Record<string, string>;
     } | null>(null);
     const hasLoadedDecisionsRef = useRef(false);
     const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -221,6 +246,7 @@ export function Decisions() {
     const pendingSearchFocusRef = useRef<number | null>(null);
     const skipSearchParamSyncRef = useRef<string | null>(null);
     const searchDebounceTimeoutRef = useRef<number | null>(null);
+    const initialQueryHydratedRef = useRef(false);
     const searchValidationFeatures = useMemo(() => ({ machineEnabled: true, originEnabled: true }), []);
     const searchDateOptions = useMemo(() => ({
         timezoneOffsetMinutes: new Date().getTimezoneOffset(),
@@ -230,7 +256,33 @@ export function Decisions() {
         () => compileDecisionSearch(debouncedSearchDraft, searchValidationFeatures, searchDateOptions),
         [debouncedSearchDraft, searchDateOptions, searchValidationFeatures],
     );
+    const appliedQuery = compiledSearch.ok
+        ? debouncedSearchDraft.trim()
+        : queryParam?.trim() ?? "";
     const queryError: SearchParseError | null = compiledSearch.ok ? null : compiledSearch.error;
+    const updatePersistedQuickFilters = useCallback((
+        update: (current: StoredQuickFilters) => StoredQuickFilters,
+    ) => {
+        const current = persistedQuickFiltersRef.current;
+        const next = update(current);
+        if (storedQuickFiltersEqual(current, next)) return;
+        persistedQuickFiltersRef.current = next;
+        saveStoredQuickFilters(next);
+        setPersistedQuickFilters(next);
+    }, []);
+
+    useLayoutEffect(() => {
+        if (initialQueryHydratedRef.current) return;
+        initialQueryHydratedRef.current = true;
+        const currentQuery = searchParams.get('q') ?? '';
+        if (currentQuery === initialQueryParam) return;
+
+        const nextParams = new URLSearchParams(searchParams);
+        if (initialQueryParam) nextParams.set('q', initialQueryParam);
+        else nextParams.delete('q');
+        skipSearchParamSyncRef.current = initialQueryParam;
+        setSearchParams(nextParams);
+    }, [initialQueryParam, searchParams, setSearchParams]);
     const searchHelp = useMemo(
         () => getSearchHelpDefinition('decisions', searchValidationFeatures, { decisions }),
         [decisions, searchValidationFeatures],
@@ -280,6 +332,8 @@ export function Decisions() {
     const quickFilterConfig = useMemo<{
         fields: QuickFilterDefinition[];
         sectionOrder: QuickFilterSectionId[];
+        hiddenSectionOrder: QuickFilterSectionId[];
+        unavailableSectionOrder: QuickFilterSectionId[];
     }>(() => {
         const fieldByColumn: Partial<Record<TableColumnId, FacetField>> = {
             id: 'id',
@@ -299,13 +353,16 @@ export function Decisions() {
         };
         const fields: QuickFilterDefinition[] = [];
         const sectionOrder: QuickFilterSectionId[] = [];
-        for (const column of visibleDecisionColumns) {
+        const hiddenSectionOrder: QuickFilterSectionId[] = [];
+        const unavailableSectionOrder: QuickFilterSectionId[] = [];
+        const visibleColumnIds = new Set(visibleDecisionColumns);
+        const addColumn = (column: TableColumnId, order: QuickFilterSectionId[]) => {
             if (column === 'time') {
-                sectionOrder.push('date');
-                continue;
+                order.push('date');
+                return;
             }
             const field = fieldByColumn[column];
-            if (!field) continue;
+            if (!field) return;
             fields.push({
                 field,
                 label: t(`tableColumns.${column}`),
@@ -313,10 +370,46 @@ export function Decisions() {
                     ? { defaultSelection: { included: ['active'], excluded: [] } }
                     : {}),
             });
-            sectionOrder.push(field);
+            order.push(field);
+        };
+        for (const column of visibleDecisionColumns) {
+            addColumn(column, sectionOrder);
         }
-        return { fields, sectionOrder };
-    }, [t, visibleDecisionColumns]);
+        for (const column of loadStoredTableColumnOrders('decisions', tableColumnPreferences.decisions)) {
+            if (!visibleColumnIds.has(column)) addColumn(column, hiddenSectionOrder);
+        }
+        const decisionFields = new Set(fields.map(({ field }) => field));
+        const alertFieldByColumn: Partial<Record<TableColumnId, FacetField>> = {
+            id: 'id',
+            instance: 'instance',
+            scenario: 'scenario',
+            country: 'country',
+            region: 'region',
+            city: 'city',
+            as: 'as',
+            source: 'ip',
+            target: 'target',
+            machine: 'machine',
+            origin: 'origin',
+            decisions: 'decision',
+        };
+        const orderedAlertColumns = loadStoredTableColumnOrders(
+            'alerts',
+            tableColumnPreferences.alerts,
+        );
+        for (const column of orderedAlertColumns) {
+            const field = alertFieldByColumn[column];
+            if (!field || decisionFields.has(field)) continue;
+            fields.push({
+                field,
+                label: t(`tableColumns.${column}`),
+                applicable: false,
+            });
+            unavailableSectionOrder.push(field);
+            decisionFields.add(field);
+        }
+        return { fields, sectionOrder, hiddenSectionOrder, unavailableSectionOrder };
+    }, [t, tableColumnPreferences.alerts, tableColumnPreferences.decisions, visibleDecisionColumns]);
     const quickFilterDateRange = useMemo(() => {
         const range = compiledSearch.ok ? getSearchDateRange(compiledSearch.ast) : { start: '', end: '' };
         return {
@@ -324,10 +417,32 @@ export function Decisions() {
             end: range.end || dateEndParam,
         };
     }, [compiledSearch, dateEndParam, dateStartParam]);
+    const applicableQuickFilterFields = useMemo(
+        () => new Set<FacetField>(DECISION_QUICK_FILTER_FIELDS),
+        [],
+    );
+
+    useEffect(() => {
+        if (!compiledSearch.ok) return;
+        const current = persistedQuickFiltersRef.current;
+        const next = syncStoredQuickFiltersFromSearch(
+            current,
+            'decisions',
+            compiledSearch.ast,
+            quickFilterDateRange,
+        );
+        if (storedQuickFiltersEqual(current, next)) return;
+        persistedQuickFiltersRef.current = next;
+        saveStoredQuickFilters(next);
+    }, [compiledSearch, quickFilterDateRange]);
+
     const getFacetSelection = useCallback((
         field: FacetField,
         selection: SearchFacetSelection,
     ): SearchFacetSelection => {
+        if (!applicableQuickFilterFields.has(field)) {
+            return getStoredQuickFilterSelection(persistedQuickFilters, field);
+        }
         if (
             field === 'status'
             && !includeExpiredParam
@@ -337,8 +452,16 @@ export function Decisions() {
             return { included: ['active'], excluded: [] };
         }
         return selection;
-    }, [includeExpiredParam]);
+    }, [applicableQuickFilterFields, includeExpiredParam, persistedQuickFilters]);
     const applyFacetSelection = useCallback((field: FacetField, requestedSelection: SearchFacetSelection) => {
+        if (!applicableQuickFilterFields.has(field)) {
+            updatePersistedQuickFilters((current) => setStoredQuickFilterSelection(
+                current,
+                field,
+                requestedSelection,
+            ));
+            return;
+        }
         const currentQuery = searchParams.get('q') ?? '';
         const currentSearch = compileDecisionSearch(currentQuery, searchValidationFeatures, searchDateOptions);
         if (!currentSearch.ok) return;
@@ -362,6 +485,11 @@ export function Decisions() {
                 nextParams.delete('include_expired');
             }
         }
+        updatePersistedQuickFilters((current) => setStoredQuickFilterSelection(
+            current,
+            field,
+            selection,
+        ));
 
         const nextQuery = serializeSearchNode(replaceSearchFacetSelection(
             currentSearch.ast,
@@ -380,12 +508,15 @@ export function Decisions() {
         setSearchParams(nextParams);
     }, [
         cancelSearchDebounce,
+        applicableQuickFilterFields,
         searchDateOptions,
         searchParams,
         searchValidationFeatures,
         setSearchParams,
+        updatePersistedQuickFilters,
     ]);
     const applyDateRange = useCallback((range: SearchDateRange) => {
+        updatePersistedQuickFilters((current) => ({ ...current, dateRange: range }));
         const currentQuery = searchParams.get('q') ?? '';
         const currentSearch = compileDecisionSearch(currentQuery, searchValidationFeatures, searchDateOptions);
         if (!currentSearch.ok) return;
@@ -410,14 +541,61 @@ export function Decisions() {
         searchParams,
         searchValidationFeatures,
         setSearchParams,
+        updatePersistedQuickFilters,
+    ]);
+    const clearQuickFilters = useCallback(() => {
+        const currentQuery = searchParams.get('q') ?? '';
+        const currentSearch = compileDecisionSearch(currentQuery, searchValidationFeatures, searchDateOptions);
+        if (!currentSearch.ok) return;
+
+        let nextSearchAst = currentSearch.ast;
+        for (const field of DECISION_QUICK_FILTER_FIELDS) {
+            nextSearchAst = replaceSearchFacetSelection(nextSearchAst, field, {
+                included: [],
+                excluded: [],
+            });
+        }
+        nextSearchAst = replaceSearchDateRange(nextSearchAst, { start: '', end: '' });
+        const nextQuery = serializeSearchNode(nextSearchAst);
+        const nextParams = new URLSearchParams(searchParams);
+        nextParams.delete('dateStart');
+        nextParams.delete('dateEnd');
+        nextParams.delete('include_expired');
+        if (nextQuery) nextParams.set('q', nextQuery);
+        else nextParams.delete('q');
+
+        cancelSearchDebounce();
+        searchDraftRef.current = nextQuery;
+        searchSelectionRef.current = { start: nextQuery.length, end: nextQuery.length };
+        skipSearchParamSyncRef.current = nextQuery;
+        setSearchDraft(nextQuery);
+        setDebouncedSearchDraft(nextQuery);
+        setSearchParams(nextParams);
+        updatePersistedQuickFilters(() => emptyStoredQuickFilters());
+    }, [
+        cancelSearchDebounce,
+        searchDateOptions,
+        searchParams,
+        searchValidationFeatures,
+        setSearchParams,
+        updatePersistedQuickFilters,
     ]);
     const formatFacetValue = useCallback((field: FacetField, value: string) => {
         if (field === 'country') return getCountryName(value, language) || value;
+        if (field === 'instance') return instanceNames[value] || value;
         if (field === 'status') {
             return value === 'active' ? t('common.active') : t('pages.decisions.expired');
         }
         return value;
-    }, [language, t]);
+    }, [instanceNames, language, t]);
+    const getFacetSearchValues = useCallback((field: FacetField, search: string) => {
+        if (field === 'country') return getCountryCodesMatchingName(search, language);
+        if (field !== 'instance') return [];
+        const normalizedSearch = search.trim().toLocaleLowerCase(language);
+        return Object.entries(instanceNames)
+            .filter(([, name]) => name.toLocaleLowerCase(language).includes(normalizedSearch))
+            .map(([id]) => id);
+    }, [instanceNames, language]);
 
     const loadConfig = useCallback(async (refresh = false) => {
         if (!refresh && configRef.current) {
@@ -429,12 +607,16 @@ export function Decisions() {
             simulationsEnabled: configData.simulations_enabled === true,
             canManageEnforcement: configData.permissions?.can_manage_enforcement !== false,
             multipleInstances: (configData.instances?.length || 0) > 1,
+            instanceNames: Object.fromEntries(
+                (configData.instances || []).map((instance) => [instance.id, instance.name]),
+            ),
         };
 
         configRef.current = nextConfig;
         setSimulationsEnabled(nextConfig.simulationsEnabled);
         setCanManageEnforcement(nextConfig.canManageEnforcement);
         setMultipleInstances(nextConfig.multipleInstances);
+        setInstanceNames(nextConfig.instanceNames);
 
         return nextConfig;
     }, []);
@@ -574,8 +756,10 @@ export function Decisions() {
     useEffect(() => {
         const queryParam = searchParams.get("q");
         const nextQuery = queryParam ?? "";
-        if (skipSearchParamSyncRef.current === nextQuery) {
-            skipSearchParamSyncRef.current = null;
+        if (skipSearchParamSyncRef.current !== null) {
+            if (skipSearchParamSyncRef.current === nextQuery) {
+                skipSearchParamSyncRef.current = null;
+            }
             return;
         }
         cancelSearchDebounce();
@@ -683,6 +867,9 @@ export function Decisions() {
         const nextQuery = debouncedSearchDraft.trim();
         const currentQuery = searchParams.get("q") ?? "";
 
+        if (skipSearchParamSyncRef.current === nextQuery) {
+            return;
+        }
         if (currentQuery === nextQuery) {
             return;
         }
@@ -974,13 +1161,17 @@ export function Decisions() {
         page: 'decisions' as const,
         fields: quickFilterConfig.fields,
         sectionOrder: quickFilterConfig.sectionOrder,
+        hiddenSectionOrder: quickFilterConfig.hiddenSectionOrder,
+        unavailableSectionOrder: quickFilterConfig.unavailableSectionOrder,
         filters: facetFilters,
         searchAst: compiledSearch.ok ? compiledSearch.ast : null,
         onSelectionChange: applyFacetSelection,
         dateRange: quickFilterDateRange,
         onDateRangeChange: applyDateRange,
+        onClearAll: clearQuickFilters,
         getSelection: getFacetSelection,
         formatValue: formatFacetValue,
+        getSearchValues: getFacetSearchValues,
         busy: tableBusy,
         refreshKey: facetRefreshKey,
     };

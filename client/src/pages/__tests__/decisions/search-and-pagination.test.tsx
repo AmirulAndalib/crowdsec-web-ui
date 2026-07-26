@@ -6,6 +6,7 @@ import { StrictMode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import * as api from '../../../lib/api';
 import { Decisions } from '../../Decisions';
+import { QUICK_FILTERS_STORAGE_KEY } from '../../../lib/quickFilters';
 import { type DecisionListItem, type PaginatedResponse } from '../../../types';
 
 async function expandDecisionSearch() {
@@ -37,7 +38,7 @@ describe('Decisions page search and pagination', () => {
     const filtersButton = screen.getByRole('button', { name: 'Filters' });
     const columnsButton = screen.getByRole('button', { name: 'Choose decision table columns' });
     expect(Array.from(columnsButton.parentElement!.children).slice(0, 3)).toEqual([
-      filtersButton,
+      filtersButton.parentElement!,
       searchButton.parentElement!.parentElement!,
       columnsButton,
     ]);
@@ -128,10 +129,22 @@ describe('Decisions page search and pagination', () => {
     expect(within(expirationHeader).getByText('1')).toBeInTheDocument();
     expect(within(expirationSection!).getByRole('button', { name: 'Clear Expiration' })).toBeInTheDocument();
 
-    await user.click(screen.getByRole('checkbox', { name: /Toggle .*Expired.* in Expiration/ }));
+    await user.click(within(drawer).getByRole('button', { name: 'Close filters' }));
+    await user.click(screen.getByRole('button', { name: 'Clear all filters' }));
     await waitFor(() => expect(fetchDecisionsPaginatedMock.mock.calls.at(-1)?.[2]?.include_expired).toBeUndefined());
     await waitFor(() => expect(within(filtersButton).queryByText('1')).not.toBeInTheDocument());
-    expect(within(expirationHeader).queryByText('1')).not.toBeInTheDocument();
+
+    await user.click(filtersButton);
+    const clearedDrawer = screen.getByRole('dialog', { name: 'Quick filters' });
+    const clearedExpirationSection = within(clearedDrawer)
+      .getByRole('button', { name: 'Expiration' })
+      .closest('section');
+    expect(clearedExpirationSection).not.toBeNull();
+    const clearedExpirationHeader = clearedExpirationSection!.firstElementChild as HTMLElement;
+    expect(within(clearedExpirationHeader).queryByText('1')).not.toBeInTheDocument();
+    expect(
+      within(clearedExpirationSection!).queryByRole('button', { name: 'Clear Expiration' }),
+    ).not.toBeInTheDocument();
   });
 
   test('uses advanced-search date-time comparisons from quick filters', async () => {
@@ -178,7 +191,7 @@ describe('Decisions page search and pagination', () => {
     expect(screen.getByRole('columnheader', { name: 'Target' })).toBeInTheDocument();
   });
 
-  test('hides the target quick filter when the target column is hidden', async () => {
+  test('lists the target quick filter below visible filters when the target column is hidden', async () => {
     window.localStorage.setItem('crowdsec-web-ui:table-column-preferences', JSON.stringify({
       decisions: ['time', 'source'],
     }));
@@ -190,8 +203,42 @@ describe('Decisions page search and pagination', () => {
 
     await userEvent.click(await screen.findByRole('button', { name: /^Filters/ }));
     const drawer = screen.getByRole('dialog', { name: 'Quick filters' });
-    expect(within(drawer).queryByRole('button', { name: 'Target' })).not.toBeInTheDocument();
+    const hiddenColumns = within(drawer).getByRole('heading', { name: 'Hidden columns' }).closest('section');
+    expect(hiddenColumns).not.toBeNull();
+    expect(within(hiddenColumns!).getByRole('button', { name: 'Target' })).toBeInTheDocument();
+    expect(within(hiddenColumns!).queryByRole('button', { name: 'Date and time' })).not.toBeInTheDocument();
     expect(screen.queryByRole('columnheader', { name: 'Target' })).not.toBeInTheDocument();
+  });
+
+  test('applies persisted common filters and keeps alert-only filters disabled and clearable', async () => {
+    window.localStorage.setItem(QUICK_FILTERS_STORAGE_KEY, JSON.stringify({
+      selections: {
+        country: { included: ['DE'], excluded: [] },
+        decision: { included: ['active'], excluded: [] },
+      },
+      dateRange: { start: '', end: '' },
+    }));
+    const fetchDecisionsPaginatedMock = vi.mocked(api.fetchDecisionsPaginated);
+    fetchDecisionsPaginatedMock.mockClear();
+
+    render(
+      <MemoryRouter initialEntries={['/decisions']}>
+        <Decisions />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchDecisionsPaginatedMock.mock.calls.at(-1)?.[2]?.q).toBe('country=DE'));
+    expect(fetchDecisionsPaginatedMock.mock.calls[0]?.[2]?.q).toBe('country=DE');
+    await userEvent.click(await screen.findByRole('button', { name: /^Filters/ }));
+    expect(screen.getByRole('button', { name: 'Decisions' })).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Clear Decisions' }));
+
+    await waitFor(() => expect(
+      JSON.parse(window.localStorage.getItem(QUICK_FILTERS_STORAGE_KEY) || '{}').selections,
+    ).toEqual({
+      country: { included: ['DE'], excluded: [] },
+    }));
+    expect(fetchDecisionsPaginatedMock.mock.calls.at(-1)?.[2]?.q).toBe('country=DE');
   });
 
   test('applies an initial advanced search URL query on the first decision load', async () => {

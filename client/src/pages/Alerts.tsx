@@ -18,9 +18,25 @@ import { EventCard } from "../components/EventCard";
 import { ContextSummary } from "../components/ContextSummary";
 import { Collapsible } from "../components/ui/Collapsible";
 import { getDisplayMetadata, isAppSecEvent } from "../lib/alertMetadata";
-import { getCountryName } from "../lib/utils";
+import { getCountryCodesMatchingName, getCountryName } from "../lib/utils";
 import { getDecisionExpirationState } from "../lib/decisionExpiration";
-import { loadStoredTableColumnPreferences, saveStoredTableColumnPreferences } from "../lib/tableColumns";
+import {
+    loadStoredTableColumnOrders,
+    loadStoredTableColumnPreferences,
+    saveStoredTableColumnPreferences,
+} from "../lib/tableColumns";
+import {
+    ALERT_QUICK_FILTER_FIELDS,
+    emptyStoredQuickFilters,
+    getStoredQuickFilterSelection,
+    loadStoredQuickFilters,
+    mergeStoredQuickFiltersIntoQuery,
+    saveStoredQuickFilters,
+    setStoredQuickFilterSelection,
+    storedQuickFiltersEqual,
+    syncStoredQuickFiltersFromSearch,
+    type StoredQuickFilters,
+} from "../lib/quickFilters";
 import { TABLE_COLUMN_DEFINITIONS } from "../../../shared/contracts";
 import { resolveMachineName } from "../../../shared/machine";
 import { collectDistinctOrigins, getOriginDisplayValue, getOriginTitle } from "../../../shared/origin";
@@ -226,11 +242,20 @@ export function Alerts() {
     const { refreshSignal } = useRefresh();
     const [facetRefreshKey, setFacetRefreshKey] = useState(refreshSignal);
     const [searchParams, setSearchParams] = useSearchParams();
-    const initialQueryParam = searchParams.get("q") ?? "";
+    const [persistedQuickFilters, setPersistedQuickFilters] = useState<StoredQuickFilters>(
+        () => loadStoredQuickFilters(),
+    );
+    const persistedQuickFiltersRef = useRef(persistedQuickFilters);
+    const [initialQueryParam] = useState(() => mergeStoredQuickFiltersIntoQuery(
+        'alerts',
+        searchParams.get("q") ?? "",
+        persistedQuickFilters,
+    ));
     const [alerts, setAlerts] = useState<AlertListItem[]>([]);
     const [simulationsEnabled, setSimulationsEnabled] = useState(false);
     const [canManageEnforcement, setCanManageEnforcement] = useState(false);
     const [multipleInstances, setMultipleInstances] = useState(false);
+    const [instanceNames, setInstanceNames] = useState<Record<string, string>>({});
     const [tableColumnPreferences, setTableColumnPreferences] = useState<TableColumnPreferences>(() => loadStoredTableColumnPreferences());
     const [showColumnsModal, setShowColumnsModal] = useState(false);
     const [searchDraft, setSearchDraft] = useState(initialQueryParam);
@@ -264,7 +289,6 @@ export function Alerts() {
     const currentSimulationFilter = simulationsEnabled ? parseSimulationFilter(searchParams.get("simulation")) : 'all';
     const alertIdParam = searchParams.get("id");
     const queryParam = searchParams.get("q");
-    const appliedQuery = queryParam?.trim() ?? "";
     const dateStartParam = searchParams.get("dateStart") ?? "";
     const dateEndParam = searchParams.get("dateEnd") ?? "";
 
@@ -300,6 +324,7 @@ export function Alerts() {
         simulationsEnabled: boolean;
         canManageEnforcement: boolean;
         multipleInstances: boolean;
+        instanceNames: Record<string, string>;
     } | null>(null);
     const hasLoadedAlertsRef = useRef(false);
     const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -308,6 +333,7 @@ export function Alerts() {
     const pendingSearchFocusRef = useRef<number | null>(null);
     const skipSearchParamSyncRef = useRef<string | null>(null);
     const searchDebounceTimeoutRef = useRef<number | null>(null);
+    const initialQueryHydratedRef = useRef(false);
     const searchValidationFeatures = useMemo(() => ({ machineEnabled: true, originEnabled: true }), []);
     const searchDateOptions = useMemo(() => ({
         timezoneOffsetMinutes: new Date().getTimezoneOffset(),
@@ -317,7 +343,33 @@ export function Alerts() {
         () => compileAlertSearch(debouncedSearchDraft, searchValidationFeatures, searchDateOptions),
         [debouncedSearchDraft, searchDateOptions, searchValidationFeatures],
     );
+    const appliedQuery = compiledSearch.ok
+        ? debouncedSearchDraft.trim()
+        : queryParam?.trim() ?? "";
     const queryError: SearchParseError | null = compiledSearch.ok ? null : compiledSearch.error;
+    const updatePersistedQuickFilters = useCallback((
+        update: (current: StoredQuickFilters) => StoredQuickFilters,
+    ) => {
+        const current = persistedQuickFiltersRef.current;
+        const next = update(current);
+        if (storedQuickFiltersEqual(current, next)) return;
+        persistedQuickFiltersRef.current = next;
+        saveStoredQuickFilters(next);
+        setPersistedQuickFilters(next);
+    }, []);
+
+    useLayoutEffect(() => {
+        if (initialQueryHydratedRef.current) return;
+        initialQueryHydratedRef.current = true;
+        const currentQuery = searchParams.get('q') ?? '';
+        if (currentQuery === initialQueryParam) return;
+
+        const nextParams = new URLSearchParams(searchParams);
+        if (initialQueryParam) nextParams.set('q', initialQueryParam);
+        else nextParams.delete('q');
+        skipSearchParamSyncRef.current = initialQueryParam;
+        setSearchParams(nextParams);
+    }, [initialQueryParam, searchParams, setSearchParams]);
     const searchHelp = useMemo(
         () => getSearchHelpDefinition('alerts', searchValidationFeatures, { alerts }),
         [alerts, searchValidationFeatures],
@@ -369,6 +421,8 @@ export function Alerts() {
     const quickFilterConfig = useMemo<{
         fields: QuickFilterDefinition[];
         sectionOrder: QuickFilterSectionId[];
+        hiddenSectionOrder: QuickFilterSectionId[];
+        unavailableSectionOrder: QuickFilterSectionId[];
     }>(() => {
         const fieldByColumn: Partial<Record<TableColumnId, FacetField>> = {
             id: 'id',
@@ -386,18 +440,59 @@ export function Alerts() {
         };
         const fields: QuickFilterDefinition[] = [];
         const sectionOrder: QuickFilterSectionId[] = [];
-        for (const column of visibleAlertColumns) {
+        const hiddenSectionOrder: QuickFilterSectionId[] = [];
+        const unavailableSectionOrder: QuickFilterSectionId[] = [];
+        const visibleColumnIds = new Set(visibleAlertColumns);
+        const addColumn = (column: TableColumnId, order: QuickFilterSectionId[]) => {
             if (column === 'time') {
-                sectionOrder.push('date');
-                continue;
+                order.push('date');
+                return;
             }
             const field = fieldByColumn[column];
-            if (!field) continue;
+            if (!field) return;
             fields.push({ field, label: t(`tableColumns.${column}`) });
-            sectionOrder.push(field);
+            order.push(field);
+        };
+        for (const column of visibleAlertColumns) {
+            addColumn(column, sectionOrder);
         }
-        return { fields, sectionOrder };
-    }, [t, visibleAlertColumns]);
+        for (const column of loadStoredTableColumnOrders('alerts', tableColumnPreferences.alerts)) {
+            if (!visibleColumnIds.has(column)) addColumn(column, hiddenSectionOrder);
+        }
+        const alertFields = new Set(fields.map(({ field }) => field));
+        const decisionFieldByColumn: Partial<Record<TableColumnId, FacetField>> = {
+            id: 'id',
+            instance: 'instance',
+            scenario: 'scenario',
+            country: 'country',
+            region: 'region',
+            city: 'city',
+            as: 'as',
+            source: 'ip',
+            action: 'action',
+            expiration: 'status',
+            target: 'target',
+            machine: 'machine',
+            origin: 'origin',
+            alert: 'alert',
+        };
+        const orderedDecisionColumns = loadStoredTableColumnOrders(
+            'decisions',
+            tableColumnPreferences.decisions,
+        );
+        for (const column of orderedDecisionColumns) {
+            const field = decisionFieldByColumn[column];
+            if (!field || alertFields.has(field)) continue;
+            fields.push({
+                field,
+                label: t(`tableColumns.${column}`),
+                applicable: false,
+            });
+            unavailableSectionOrder.push(field);
+            alertFields.add(field);
+        }
+        return { fields, sectionOrder, hiddenSectionOrder, unavailableSectionOrder };
+    }, [t, tableColumnPreferences.alerts, tableColumnPreferences.decisions, visibleAlertColumns]);
     const quickFilterDateRange = useMemo(() => {
         const range = compiledSearch.ok ? getSearchDateRange(compiledSearch.ast) : { start: '', end: '' };
         return {
@@ -405,7 +500,40 @@ export function Alerts() {
             end: range.end || dateEndParam,
         };
     }, [compiledSearch, dateEndParam, dateStartParam]);
+    const applicableQuickFilterFields = useMemo(
+        () => new Set<FacetField>(ALERT_QUICK_FILTER_FIELDS),
+        [],
+    );
+    const getFacetSelection = useCallback((
+        field: FacetField,
+        selection: SearchFacetSelection,
+    ): SearchFacetSelection => (
+        applicableQuickFilterFields.has(field)
+            ? selection
+            : getStoredQuickFilterSelection(persistedQuickFilters, field)
+    ), [applicableQuickFilterFields, persistedQuickFilters]);
+
+    useEffect(() => {
+        if (!compiledSearch.ok) return;
+        const current = persistedQuickFiltersRef.current;
+        const next = syncStoredQuickFiltersFromSearch(
+            current,
+            'alerts',
+            compiledSearch.ast,
+            quickFilterDateRange,
+        );
+        if (storedQuickFiltersEqual(current, next)) return;
+        persistedQuickFiltersRef.current = next;
+        saveStoredQuickFilters(next);
+    }, [compiledSearch, quickFilterDateRange]);
+
     const applyFacetSelection = useCallback((field: FacetField, selection: SearchFacetSelection) => {
+        updatePersistedQuickFilters((current) => setStoredQuickFilterSelection(
+            current,
+            field,
+            selection,
+        ));
+        if (!applicableQuickFilterFields.has(field)) return;
         const currentQuery = searchParams.get('q') ?? '';
         const currentSearch = compileAlertSearch(currentQuery, searchValidationFeatures, searchDateOptions);
         if (!currentSearch.ok) return;
@@ -428,12 +556,15 @@ export function Alerts() {
         setSearchParams(nextParams);
     }, [
         cancelSearchDebounce,
+        applicableQuickFilterFields,
         searchDateOptions,
         searchParams,
         searchValidationFeatures,
         setSearchParams,
+        updatePersistedQuickFilters,
     ]);
     const applyDateRange = useCallback((range: SearchDateRange) => {
+        updatePersistedQuickFilters((current) => ({ ...current, dateRange: range }));
         const currentQuery = searchParams.get('q') ?? '';
         const currentSearch = compileAlertSearch(currentQuery, searchValidationFeatures, searchDateOptions);
         if (!currentSearch.ok) return;
@@ -458,14 +589,60 @@ export function Alerts() {
         searchParams,
         searchValidationFeatures,
         setSearchParams,
+        updatePersistedQuickFilters,
+    ]);
+    const clearQuickFilters = useCallback(() => {
+        const currentQuery = searchParams.get('q') ?? '';
+        const currentSearch = compileAlertSearch(currentQuery, searchValidationFeatures, searchDateOptions);
+        if (!currentSearch.ok) return;
+
+        let nextSearchAst = currentSearch.ast;
+        for (const field of ALERT_QUICK_FILTER_FIELDS) {
+            nextSearchAst = replaceSearchFacetSelection(nextSearchAst, field, {
+                included: [],
+                excluded: [],
+            });
+        }
+        nextSearchAst = replaceSearchDateRange(nextSearchAst, { start: '', end: '' });
+        const nextQuery = serializeSearchNode(nextSearchAst);
+        const nextParams = new URLSearchParams(searchParams);
+        nextParams.delete('dateStart');
+        nextParams.delete('dateEnd');
+        if (nextQuery) nextParams.set('q', nextQuery);
+        else nextParams.delete('q');
+
+        cancelSearchDebounce();
+        searchDraftRef.current = nextQuery;
+        searchSelectionRef.current = { start: nextQuery.length, end: nextQuery.length };
+        skipSearchParamSyncRef.current = nextQuery;
+        setSearchDraft(nextQuery);
+        setDebouncedSearchDraft(nextQuery);
+        setSearchParams(nextParams);
+        updatePersistedQuickFilters(() => emptyStoredQuickFilters());
+    }, [
+        cancelSearchDebounce,
+        searchDateOptions,
+        searchParams,
+        searchValidationFeatures,
+        setSearchParams,
+        updatePersistedQuickFilters,
     ]);
     const formatFacetValue = useCallback((field: FacetField, value: string) => {
         if (field === 'country') return getCountryName(value, language) || value;
+        if (field === 'instance') return instanceNames[value] || value;
         if (field === 'decision') {
             return value === 'active' ? t('common.active') : t('common.inactive');
         }
         return value;
-    }, [language, t]);
+    }, [instanceNames, language, t]);
+    const getFacetSearchValues = useCallback((field: FacetField, search: string) => {
+        if (field === 'country') return getCountryCodesMatchingName(search, language);
+        if (field !== 'instance') return [];
+        const normalizedSearch = search.trim().toLocaleLowerCase(language);
+        return Object.entries(instanceNames)
+            .filter(([, name]) => name.toLocaleLowerCase(language).includes(normalizedSearch))
+            .map(([id]) => id);
+    }, [instanceNames, language]);
 
     const loadConfig = useCallback(async (refresh = false) => {
         if (!refresh && configRef.current) {
@@ -477,12 +654,16 @@ export function Alerts() {
             simulationsEnabled: configData.simulations_enabled === true,
             canManageEnforcement: configData.permissions?.can_manage_enforcement !== false,
             multipleInstances: (configData.instances?.length || 0) > 1,
+            instanceNames: Object.fromEntries(
+                (configData.instances || []).map((instance) => [instance.id, instance.name]),
+            ),
         };
 
         configRef.current = nextConfig;
         setSimulationsEnabled(nextConfig.simulationsEnabled);
         setCanManageEnforcement(nextConfig.canManageEnforcement);
         setMultipleInstances(nextConfig.multipleInstances);
+        setInstanceNames(nextConfig.instanceNames);
 
         return nextConfig;
     }, []);
@@ -680,8 +861,10 @@ export function Alerts() {
 
     useEffect(() => {
         const nextQuery = queryParam ?? "";
-        if (skipSearchParamSyncRef.current === nextQuery) {
-            skipSearchParamSyncRef.current = null;
+        if (skipSearchParamSyncRef.current !== null) {
+            if (skipSearchParamSyncRef.current === nextQuery) {
+                skipSearchParamSyncRef.current = null;
+            }
             return;
         }
         cancelSearchDebounce();
@@ -765,6 +948,9 @@ export function Alerts() {
         }
 
         const nextQuery = debouncedSearchDraft.trim();
+        if (skipSearchParamSyncRef.current === nextQuery) {
+            return;
+        }
         if (queryParam === nextQuery) {
             return;
         }
@@ -1140,12 +1326,17 @@ export function Alerts() {
         page: 'alerts' as const,
         fields: quickFilterConfig.fields,
         sectionOrder: quickFilterConfig.sectionOrder,
+        hiddenSectionOrder: quickFilterConfig.hiddenSectionOrder,
+        unavailableSectionOrder: quickFilterConfig.unavailableSectionOrder,
         filters: facetFilters,
         searchAst: compiledSearch.ok ? compiledSearch.ast : null,
         onSelectionChange: applyFacetSelection,
         dateRange: quickFilterDateRange,
         onDateRangeChange: applyDateRange,
+        onClearAll: clearQuickFilters,
+        getSelection: getFacetSelection,
         formatValue: formatFacetValue,
+        getSearchValues: getFacetSearchValues,
         busy: tableBusy,
         refreshKey: facetRefreshKey,
     };
