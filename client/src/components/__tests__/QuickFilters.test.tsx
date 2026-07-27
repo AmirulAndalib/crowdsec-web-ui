@@ -35,6 +35,7 @@ function renderFilters(
     onClearAll?: Mock<() => void>;
     selection?: SearchFacetSelection;
     dateRange?: SearchDateRange;
+    lookbackHours?: number;
     sectionOrder?: QuickFilterSectionId[];
     hiddenSectionOrder?: QuickFilterSectionId[];
   } = {},
@@ -58,6 +59,7 @@ function renderFilters(
         dateRange={options.dateRange ?? { start: '', end: '' }}
         onDateRangeChange={onDateRangeChange}
         onClearAll={onClearAll}
+        lookbackHours={options.lookbackHours}
         getSelection={options.selection ? () => options.selection! : undefined}
         sectionOrder={options.sectionOrder}
         hiddenSectionOrder={options.hiddenSectionOrder}
@@ -82,8 +84,61 @@ describe('QuickFilters', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
+  });
+
+  test('places the simulation mode after Scenario and only renders it when configured', async () => {
+    const user = userEvent.setup();
+    const onSimulationChange = vi.fn();
+    const props = {
+      page: 'alerts' as const,
+      fields: [
+        { field: 'scenario' as const, label: 'Scenario' },
+        { field: 'country' as const, label: 'Country' },
+      ],
+      sectionOrder: ['scenario', 'country'] as QuickFilterSectionId[],
+      filters: {},
+      searchAst: null,
+      onSelectionChange: vi.fn(),
+      dateRange: { start: '', end: '' },
+      onDateRangeChange: vi.fn(),
+      onClearAll: vi.fn(),
+    };
+    const { rerender } = render(
+      <I18nContext.Provider value={i18n}>
+        <QuickFilters
+          {...props}
+          simulation={{ value: 'all', onChange: onSimulationChange }}
+        />
+      </I18nContext.Provider>,
+    );
+
+    expect(screen.getByRole('button', { name: 'Filters' })).not.toHaveTextContent('1');
+    await user.click(screen.getByRole('button', { name: 'Filters' }));
+    const scenario = screen.getByRole('button', { name: 'Scenario' });
+    const mode = screen.getByRole('button', { name: 'Mode' });
+    const country = screen.getByRole('button', { name: 'Country' });
+    expect(scenario.compareDocumentPosition(mode) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(mode.compareDocumentPosition(country) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await user.click(mode);
+    expect(screen.queryByRole('checkbox', { name: /All/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Toggle Live in Mode' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Toggle Simulation in Mode' })).toBeChecked();
+    await user.click(screen.getByRole('checkbox', { name: 'Toggle Live in Mode' }));
+    expect(onSimulationChange).toHaveBeenCalledWith('simulated');
+
+    await user.click(within(screen.getByRole('dialog', { name: 'Quick filters' }))
+      .getByRole('button', { name: 'Close filters' }));
+    rerender(
+      <I18nContext.Provider value={i18n}>
+        <QuickFilters {...props} />
+      </I18nContext.Provider>,
+    );
+    await user.click(screen.getByRole('button', { name: 'Filters' }));
+    expect(screen.queryByRole('button', { name: 'Mode' })).not.toBeInTheDocument();
   });
 
   test('does not fetch until the drawer and a group are opened', async () => {
@@ -354,6 +409,65 @@ describe('QuickFilters', () => {
       end: '',
     });
     expect(from).toHaveAttribute('step', '3600');
+  });
+
+  test('offers touch-friendly one-tap date ranges while retaining custom inputs', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 6, 27, 12, 34));
+    const { onDateRangeChange } = renderFilters();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Date and time' }));
+
+    const last24Hours = screen.getByRole('button', { name: 'Last 24 hours' });
+    expect(last24Hours).toHaveClass('min-h-11');
+    expect(last24Hours).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: 'Last 48 hours' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Last 30 days' })).not.toBeInTheDocument();
+    expect(within(screen.getByText('Quick ranges').closest('fieldset')!)
+      .getAllByRole('button')).toHaveLength(4);
+    expect(screen.getByText('Custom range')).toBeInTheDocument();
+    expect(screen.getByLabelText('From')).toHaveClass('text-base', 'sm:text-sm', 'min-w-0');
+
+    fireEvent.click(last24Hours);
+    expect(onDateRangeChange).toHaveBeenLastCalledWith({
+      start: '2026-07-26T12:00',
+      end: '',
+    });
+    expect(api.fetchFacet).not.toHaveBeenCalled();
+  });
+
+  test('uses the configured lookback as the longest quick range', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 6, 27, 12, 34));
+    const { onDateRangeChange } = renderFilters({ lookbackHours: 72 });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Date and time' }));
+
+    expect(screen.getByRole('button', { name: 'Last 3 days' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Last 48 hours' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Last 7 days' })).not.toBeInTheDocument();
+    expect(within(screen.getByText('Quick ranges').closest('fieldset')!)
+      .getAllByRole('button')).toHaveLength(4);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Last 3 days' }));
+    expect(onDateRangeChange).toHaveBeenLastCalledWith({
+      start: '2026-07-24T12:00',
+      end: '',
+    });
+  });
+
+  test('marks a matching quick date range as selected', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 6, 27, 12, 34));
+    renderFilters({ dateRange: { start: '2026-07-20T12', end: '' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Date and time' }));
+
+    expect(screen.getByRole('button', { name: 'Last 7 days' }))
+      .toHaveAttribute('aria-pressed', 'true');
   });
 
   test('orders sections as requested and does not render a date calendar icon', async () => {

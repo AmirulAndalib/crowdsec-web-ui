@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from 'vitest';
 import path from 'path';
 import type { AlertRecord, DashboardStatsResponse, PaginatedResponse, SlimAlert } from '../../../shared/contracts';
 import { CrowdsecDatabase } from '../../database';
-import { DatabaseQueryWorker } from '../../query-worker-client';
+import { DatabaseQueryWorker, QueryWorkerTimeoutError } from '../../query-worker-client';
 import {
   createController,
   dashboardDateKey,
@@ -14,6 +14,51 @@ import {
 } from './harness';
 
 describe('createApp dashboard API', () => {
+  test('handles an analytics timeout immediately while dashboard enrichment is still pending', async () => {
+    const database = new CrowdsecDatabase({ dbPath: path.join(tempDir, 'test.db') });
+    seedAlert(database, sampleAlert());
+    const queryWorker = new DatabaseQueryWorker({ dbPath: database.dbPath });
+    const realAll = queryWorker.all.bind(queryWorker);
+    vi.spyOn(queryWorker, 'all').mockImplementation((sql, params, options) => {
+      if (sql.includes('SELECT simulated, COUNT(*) AS count')) {
+        return Promise.reject(new QueryWorkerTimeoutError(30_000, {
+          label: 'dashboard totals regression query',
+        }));
+      }
+      return realAll(sql, params, options);
+    });
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandledRejections.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+    const { controller } = createController({
+      database,
+      queryWorker,
+      initialCacheState: {
+        isInitialized: true,
+        isComplete: true,
+        lastUpdate: new Date().toISOString(),
+      },
+      attackLocationResolver: {
+        resolve: (locations) => new Promise((resolve) => {
+          setTimeout(() => resolve(locations), 25);
+        }),
+      },
+    });
+
+    try {
+      const response = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats'));
+      expect(response.status).toBe(504);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+      controller.stopBackgroundTasks();
+      database.close();
+    }
+  });
+
   test('aggregates dashboard stats with mutual filters, simulation mode, and timezone date ranges', async () => {
     const createdAt = new Date().toISOString();
     const stopAt = new Date(Date.now() + 60 * 60 * 1_000).toISOString();
@@ -127,12 +172,21 @@ describe('createApp dashboard API', () => {
       filteredTotals: { alerts: 1, decisions: 0, simulatedAlerts: 1, simulatedDecisions: 1 },
     }));
 
+    const timelineResponse = await controller.fetch(new Request(
+      `http://localhost/crowdsec/api/dashboard/stats?tz_offset=${timezoneOffset}`,
+    ));
+    const timelinePayload = await timelineResponse.json() as DashboardStatsResponse;
     const dateResponse = await controller.fetch(new Request(`http://localhost/crowdsec/api/dashboard/stats?dateStart=${dateKey}&dateEnd=${dateKey}&tz_offset=${timezoneOffset}`));
-    expect((await dateResponse.json()) as {
-      filteredTotals: { alerts: number; decisions: number; simulatedAlerts: number; simulatedDecisions: number };
-    }).toEqual(expect.objectContaining({
+    const datePayload = await dateResponse.json() as DashboardStatsResponse;
+    expect(datePayload).toEqual(expect.objectContaining({
       filteredTotals: { alerts: 3, decisions: 2, simulatedAlerts: 1, simulatedDecisions: 1 },
     }));
+    expect(datePayload.series.unfilteredAlertsHistory.map((bucket) => bucket.date)).toEqual(
+      timelinePayload.series.unfilteredAlertsHistory.map((bucket) => bucket.date),
+    );
+    expect(datePayload.series.unfilteredDecisionsHistory.map((bucket) => bucket.date)).toEqual(
+      timelinePayload.series.unfilteredDecisionsHistory.map((bucket) => bucket.date),
+    );
 
     controller.stopBackgroundTasks();
     database.close();
@@ -314,8 +368,16 @@ describe('createApp dashboard API', () => {
       ))).toBe(true);
 
       await new Promise((resolve) => setTimeout(resolve, 1_100));
-      const secondResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats'));
-      expect((await secondResponse.json()) as {
+      let secondResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats'));
+      let secondDashboard = (await secondResponse.json()) as DashboardStatsResponse;
+      if (secondDashboard.pending) {
+        await vi.waitFor(async () => {
+          secondResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats'));
+          secondDashboard = (await secondResponse.json()) as DashboardStatsResponse;
+          expect(secondDashboard.pending).not.toBe(true);
+        });
+      }
+      expect(secondDashboard as {
         totals: { decisions: number };
         filteredTotals: { decisions: number };
       }).toEqual(

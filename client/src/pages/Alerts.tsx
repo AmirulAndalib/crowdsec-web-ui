@@ -28,13 +28,16 @@ import {
 import {
     ALERT_QUICK_FILTER_FIELDS,
     emptyStoredQuickFilters,
+    getQuickFilterSimulation,
     getStoredQuickFilterSelection,
     loadStoredQuickFilters,
     mergeStoredQuickFiltersIntoQuery,
+    quickFilterSimulationSelection,
     saveStoredQuickFilters,
     setStoredQuickFilterSelection,
     storedQuickFiltersEqual,
     syncStoredQuickFiltersFromSearch,
+    type QuickFilterSimulationValue,
     type StoredQuickFilters,
 } from "../lib/quickFilters";
 import { TABLE_COLUMN_DEFINITIONS } from "../../../shared/contracts";
@@ -252,6 +255,7 @@ export function Alerts() {
         persistedQuickFilters,
     ));
     const [alerts, setAlerts] = useState<AlertListItem[]>([]);
+    const [lookbackHours, setLookbackHours] = useState(168);
     const [simulationsEnabled, setSimulationsEnabled] = useState(false);
     const [canManageEnforcement, setCanManageEnforcement] = useState(false);
     const [multipleInstances, setMultipleInstances] = useState(false);
@@ -321,6 +325,7 @@ export function Alerts() {
     }) => Promise<void>>(async () => {});
     const lastRefreshSignalRef = useRef(refreshSignal);
     const configRef = useRef<{
+        lookbackHours: number;
         simulationsEnabled: boolean;
         canManageEnforcement: boolean;
         multipleInstances: boolean;
@@ -512,6 +517,10 @@ export function Alerts() {
             ? selection
             : getStoredQuickFilterSelection(persistedQuickFilters, field)
     ), [applicableQuickFilterFields, persistedQuickFilters]);
+    const quickFilterSimulation = getQuickFilterSimulation(
+        compiledSearch.ok ? compiledSearch.ast : null,
+        currentSimulationFilter,
+    );
 
     useEffect(() => {
         if (!compiledSearch.ok) return;
@@ -563,6 +572,37 @@ export function Alerts() {
         setSearchParams,
         updatePersistedQuickFilters,
     ]);
+    const applySimulationSelection = useCallback((simulation: QuickFilterSimulationValue) => {
+        const currentQuery = searchParams.get('q') ?? '';
+        const currentSearch = compileAlertSearch(currentQuery, searchValidationFeatures, searchDateOptions);
+        if (!currentSearch.ok) return;
+
+        const nextQuery = serializeSearchNode(replaceSearchFacetSelection(
+            currentSearch.ast,
+            'sim',
+            quickFilterSimulationSelection(simulation),
+        ));
+        const nextParams = new URLSearchParams(searchParams);
+        nextParams.delete('simulation');
+        if (nextQuery) nextParams.set('q', nextQuery);
+        else nextParams.delete('q');
+
+        cancelSearchDebounce();
+        searchDraftRef.current = nextQuery;
+        searchSelectionRef.current = { start: nextQuery.length, end: nextQuery.length };
+        skipSearchParamSyncRef.current = nextQuery;
+        setSearchDraft(nextQuery);
+        setDebouncedSearchDraft(nextQuery);
+        setSearchParams(nextParams);
+        updatePersistedQuickFilters((current) => ({ ...current, simulation }));
+    }, [
+        cancelSearchDebounce,
+        searchDateOptions,
+        searchParams,
+        searchValidationFeatures,
+        setSearchParams,
+        updatePersistedQuickFilters,
+    ]);
     const applyDateRange = useCallback((range: SearchDateRange) => {
         updatePersistedQuickFilters((current) => ({ ...current, dateRange: range }));
         const currentQuery = searchParams.get('q') ?? '';
@@ -603,11 +643,16 @@ export function Alerts() {
                 excluded: [],
             });
         }
+        nextSearchAst = replaceSearchFacetSelection(nextSearchAst, 'sim', {
+            included: [],
+            excluded: [],
+        });
         nextSearchAst = replaceSearchDateRange(nextSearchAst, { start: '', end: '' });
         const nextQuery = serializeSearchNode(nextSearchAst);
         const nextParams = new URLSearchParams(searchParams);
         nextParams.delete('dateStart');
         nextParams.delete('dateEnd');
+        nextParams.delete('simulation');
         if (nextQuery) nextParams.set('q', nextQuery);
         else nextParams.delete('q');
 
@@ -651,6 +696,7 @@ export function Alerts() {
 
         const configData = await fetchConfig();
         const nextConfig = {
+            lookbackHours: configData.lookback_hours,
             simulationsEnabled: configData.simulations_enabled === true,
             canManageEnforcement: configData.permissions?.can_manage_enforcement !== false,
             multipleInstances: (configData.instances?.length || 0) > 1,
@@ -660,6 +706,7 @@ export function Alerts() {
         };
 
         configRef.current = nextConfig;
+        setLookbackHours(nextConfig.lookbackHours);
         setSimulationsEnabled(nextConfig.simulationsEnabled);
         setCanManageEnforcement(nextConfig.canManageEnforcement);
         setMultipleInstances(nextConfig.multipleInstances);
@@ -1334,6 +1381,10 @@ export function Alerts() {
         dateRange: quickFilterDateRange,
         onDateRangeChange: applyDateRange,
         onClearAll: clearQuickFilters,
+        lookbackHours,
+        simulation: simulationsEnabled
+            ? { value: quickFilterSimulation, onChange: applySimulationSelection }
+            : undefined,
         getSelection: getFacetSelection,
         formatValue: formatFacetValue,
         getSearchValues: getFacetSearchValues,
@@ -1426,42 +1477,44 @@ export function Alerts() {
 
             <div className="space-y-2">
                 <div className="flex items-stretch gap-2">
-                    <QuickFilters {...quickFilterProps} />
-                    <CollapsibleSearchControls
-                        inputRef={searchInputRef}
-                        onHelp={() => setShowSearchSyntaxModal(true)}
-                    >
-                        <HighlightedSearchInput
-                            ref={searchInputRef}
-                            searchPage="alerts"
-                            showSearchIcon={false}
-                            containerClassName="rounded-l-none"
-                            className="rounded-l-none"
-                            searchFeatures={searchValidationFeatures}
-                            placeholder={t('pages.alerts.filterPlaceholder')}
-                            value={searchDraft}
-                            error={queryError}
-                            onChange={(e) => {
-                                searchDraftRef.current = e.target.value;
-                                setSearchDraft(e.target.value);
-                                updateSearchSelectionFromInput(e.target);
-                            }}
-                            onClick={(e) => updateSearchSelectionFromInput(e.currentTarget)}
-                            onKeyUp={(e) => updateSearchSelectionFromInput(e.currentTarget)}
-                            onSelect={(e) => updateSearchSelectionFromInput(e.currentTarget)}
-                            aria-invalid={queryError ? 'true' : 'false'}
-                            aria-describedby={queryError ? 'alerts-search-error' : undefined}
-                        />
-                    </CollapsibleSearchControls>
                     <button
                         type="button"
                         onClick={() => setShowColumnsModal(true)}
-                        className="ml-auto inline-flex items-center justify-center rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 text-gray-600 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
+                        className="inline-flex items-center justify-center rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 text-gray-600 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
                         aria-label={t('components.tableColumns.chooseAlertColumns')}
                         title={t('components.tableColumns.chooseColumns')}
                     >
                         <Columns3 size={18} />
                     </button>
+                    <div className="ml-auto flex min-w-0 flex-1 items-stretch justify-end gap-2">
+                        <CollapsibleSearchControls
+                            inputRef={searchInputRef}
+                            onHelp={() => setShowSearchSyntaxModal(true)}
+                        >
+                            <HighlightedSearchInput
+                                ref={searchInputRef}
+                                searchPage="alerts"
+                                showSearchIcon={false}
+                                containerClassName="rounded-r-none"
+                                className="rounded-r-none"
+                                searchFeatures={searchValidationFeatures}
+                                placeholder={t('pages.alerts.filterPlaceholder')}
+                                value={searchDraft}
+                                error={queryError}
+                                onChange={(e) => {
+                                    searchDraftRef.current = e.target.value;
+                                    setSearchDraft(e.target.value);
+                                    updateSearchSelectionFromInput(e.target);
+                                }}
+                                onClick={(e) => updateSearchSelectionFromInput(e.currentTarget)}
+                                onKeyUp={(e) => updateSearchSelectionFromInput(e.currentTarget)}
+                                onSelect={(e) => updateSearchSelectionFromInput(e.currentTarget)}
+                                aria-invalid={queryError ? 'true' : 'false'}
+                                aria-describedby={queryError ? 'alerts-search-error' : undefined}
+                            />
+                        </CollapsibleSearchControls>
+                        <QuickFilters {...quickFilterProps} />
+                    </div>
                 </div>
                 {queryError && (
                     <p id="alerts-search-error" className="text-xs text-red-600 dark:text-red-400">

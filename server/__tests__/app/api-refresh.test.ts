@@ -3,6 +3,7 @@ import path from 'path';
 import type { AlertRecord, DashboardStatsResponse, PaginatedResponse, SlimAlert } from '../../../shared/contracts';
 import { CrowdsecDatabase } from '../../database';
 import { DatabaseQueryWorker } from '../../query-worker-client';
+import { DatabaseSyncWorker } from '../../sync-worker-client';
 import {
   createController,
   dashboardDateKey,
@@ -167,7 +168,7 @@ describe('createApp refresh API', () => {
     expect(fetchCalls.some((call) => call.url.includes('/v1/alerts?'))).toBe(true);
   });
 
-  test('publishes one revision only after dashboard, alert, and decision views agree', async () => {
+  test('publishes the committed revision while dashboard analytics warm in the background', async () => {
     const initialAlert = sampleAlert({
       id: 901,
       uuid: 'refresh-consistency-901',
@@ -235,11 +236,18 @@ describe('createApp refresh API', () => {
         controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10&include_decisions=false')),
         controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=10')),
       ]);
-      const dashboard = (await dashboardResponse.json()) as DashboardStatsResponse;
+      let dashboard = (await dashboardResponse.json()) as DashboardStatsResponse;
       const alerts = (await alertsResponse.json()) as PaginatedResponse<SlimAlert>;
       const decisions = (await decisionsResponse.json()) as PaginatedResponse<{ id: string | number }>;
 
-      expect(dashboard.pending).toBeUndefined();
+      if (dashboard.pending) {
+        expect(dashboard.totals.alerts).toBe(1);
+        await vi.waitFor(async () => {
+          const response = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats'));
+          dashboard = (await response.json()) as DashboardStatsResponse;
+          expect(dashboard.pending).not.toBe(true);
+        });
+      }
       expect(dashboard.totals.alerts).toBe(alerts.pagination.total);
       expect(dashboard.filteredTotals.alerts).toBe(alerts.pagination.total);
       expect(
@@ -248,6 +256,227 @@ describe('createApp refresh API', () => {
       expect(alerts.data.map((alert) => alert.id).sort()).toEqual([901, 902]);
       expect(decisions.data.map((decision) => Number(decision.id)).sort()).toEqual([9010, 9020]);
     } finally {
+      controller.stopBackgroundTasks();
+      database.close();
+    }
+  });
+
+  test('serves the previous complete revision on every page while a high-load refresh is uncommitted', async () => {
+    const initialAlert = sampleAlert({
+      id: 921,
+      uuid: 'atomic-refresh-921',
+      created_at: new Date(Date.now() - 4_000).toISOString(),
+      decisions: [{
+        id: 9210,
+        value: '192.0.2.21',
+        stop_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+        type: 'ban',
+        origin: 'manual',
+        simulated: false,
+      }],
+    });
+    const refreshedAlert = sampleAlert({
+      id: 922,
+      uuid: 'atomic-refresh-922',
+      created_at: new Date(Date.now() - 1_000).toISOString(),
+      decisions: [{
+        id: 9220,
+        value: '192.0.2.22',
+        stop_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+        type: 'ban',
+        origin: 'manual',
+        simulated: false,
+      }],
+    });
+    const database = new CrowdsecDatabase({ dbPath: path.join(tempDir, 'test.db') });
+    seedAlert(database, initialAlert);
+    const queryWorker = new DatabaseQueryWorker({ dbPath: database.dbPath });
+    const syncWorker = new DatabaseSyncWorker({ dbPath: database.dbPath });
+    const realDuplicateRefresh = syncWorker.refreshDecisionDuplicateFlags.bind(syncWorker);
+    let releaseCommit!: () => void;
+    const commitGate = new Promise<void>((resolve) => {
+      releaseCommit = resolve;
+    });
+    let duplicateRefreshReached!: () => void;
+    const duplicateRefreshStarted = new Promise<void>((resolve) => {
+      duplicateRefreshReached = resolve;
+    });
+    vi.spyOn(syncWorker, 'refreshDecisionDuplicateFlags').mockImplementation(async (now) => {
+      await realDuplicateRefresh(now);
+      duplicateRefreshReached();
+      await commitGate;
+    });
+    const { controller, lapiClient } = createController({
+      database,
+      queryWorker,
+      syncWorker,
+      initialCacheState: {
+        isInitialized: true,
+        isComplete: true,
+        lastUpdate: new Date(Date.now() - 5_000).toISOString(),
+      },
+      fetchResolver: (url) => url.includes('/v1/alerts?')
+        ? Response.json([initialAlert, refreshedAlert])
+        : undefined,
+    });
+    await lapiClient.login();
+
+    try {
+      const initialDashboard = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats'));
+      expect(((await initialDashboard.json()) as DashboardStatsResponse).totals.alerts).toBe(1);
+
+      const refreshPromise = controller.fetch(new Request('http://localhost/crowdsec/api/cache/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'delta' }),
+      }));
+      await duplicateRefreshStarted;
+
+      const [dashboardResponse, alertsResponse, decisionsResponse] = await Promise.all([
+        controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats')),
+        controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10&include_decisions=false')),
+        controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=10')),
+      ]);
+      const dashboard = (await dashboardResponse.json()) as DashboardStatsResponse;
+      const alerts = (await alertsResponse.json()) as PaginatedResponse<SlimAlert>;
+      const decisions = (await decisionsResponse.json()) as PaginatedResponse<{ id: string | number }>;
+      expect(dashboard.totals.alerts).toBe(1);
+      expect(alerts.data.map((alert) => alert.id)).toEqual([921]);
+      expect(decisions.data.map((decision) => Number(decision.id))).toEqual([9210]);
+
+      releaseCommit();
+      expect((await refreshPromise).status).toBe(200);
+
+      const committedAlerts = await controller.fetch(
+        new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10&include_decisions=false'),
+      );
+      expect(((await committedAlerts.json()) as PaginatedResponse<SlimAlert>).data.map((alert) => alert.id).sort())
+        .toEqual([921, 922]);
+    } finally {
+      releaseCommit();
+      controller.stopBackgroundTasks();
+      database.close();
+    }
+  });
+
+  test('releases page reads after commit while the matching dashboard revision warms', async () => {
+    const initialAlert = sampleAlert({
+      id: 931,
+      uuid: 'publication-barrier-931',
+      created_at: new Date(Date.now() - 4_000).toISOString(),
+      decisions: [{
+        id: 9310,
+        value: '192.0.2.31',
+        stop_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+        type: 'ban',
+        origin: 'manual',
+        simulated: false,
+      }],
+    });
+    const refreshedAlert = sampleAlert({
+      id: 932,
+      uuid: 'publication-barrier-932',
+      created_at: new Date(Date.now() - 1_000).toISOString(),
+      decisions: [{
+        id: 9320,
+        value: '192.0.2.32',
+        stop_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+        type: 'ban',
+        origin: 'manual',
+        simulated: false,
+      }],
+    });
+    const database = new CrowdsecDatabase({ dbPath: path.join(tempDir, 'test.db') });
+    seedAlert(database, initialAlert);
+    const queryWorker = new DatabaseQueryWorker({ dbPath: database.dbPath });
+    const analyticsQueryWorker = new DatabaseQueryWorker({ dbPath: database.dbPath, maxWorkers: 1 });
+    const realAll = analyticsQueryWorker.all.bind(analyticsQueryWorker);
+    let holdDashboardIndex = false;
+    let dashboardIndexHeld = false;
+    let releaseDashboard!: () => void;
+    const dashboardGate = new Promise<void>((resolve) => {
+      releaseDashboard = resolve;
+    });
+    let dashboardBuildReached!: () => void;
+    const dashboardBuildStarted = new Promise<void>((resolve) => {
+      dashboardBuildReached = resolve;
+    });
+    vi.spyOn(analyticsQueryWorker, 'all').mockImplementation(async (sql, params, options) => {
+      if (
+        holdDashboardIndex
+        && !dashboardIndexHeld
+      ) {
+        dashboardIndexHeld = true;
+        dashboardBuildReached();
+        await dashboardGate;
+      }
+      return realAll(sql, params, options);
+    });
+    const { controller, lapiClient } = createController({
+      database,
+      queryWorker,
+      analyticsQueryWorker,
+      initialCacheState: {
+        isInitialized: true,
+        isComplete: true,
+        lastUpdate: new Date(Date.now() - 5_000).toISOString(),
+      },
+      fetchResolver: (url) => url.includes('/v1/alerts?')
+        ? Response.json([initialAlert, refreshedAlert])
+        : undefined,
+    });
+    await lapiClient.login();
+
+    try {
+      const initialDashboard = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats'));
+      expect(((await initialDashboard.json()) as DashboardStatsResponse).totals.alerts).toBe(1);
+      holdDashboardIndex = true;
+
+      const refreshPromise = controller.fetch(new Request('http://localhost/crowdsec/api/cache/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'delta' }),
+      }));
+      await dashboardBuildStarted;
+
+      const completedRefresh = await Promise.race([
+        refreshPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+      ]);
+      if (!completedRefresh) {
+        releaseDashboard();
+        await refreshPromise;
+        throw new Error('Refresh response remained blocked by dashboard preparation');
+      }
+      expect(completedRefresh.status).toBe(200);
+
+      const readsPromise = Promise.all([
+        controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10&include_decisions=false')),
+        controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=10')),
+      ]).then(async ([alertsResponse, decisionsResponse]) => ({
+        alerts: (await alertsResponse.json()) as PaginatedResponse<SlimAlert>,
+        decisions: (await decisionsResponse.json()) as PaginatedResponse<{ id: string | number }>,
+      }));
+      const pendingReads = await Promise.race([
+        readsPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+      ]);
+      expect(pendingReads).not.toBeNull();
+      if (!pendingReads) throw new Error('Page reads remained blocked by dashboard preparation');
+      expect(pendingReads.alerts.pagination.total).toBe(2);
+      expect(pendingReads.decisions.pagination.total).toBe(2);
+
+      const pendingDashboardResponse = await controller.fetch(
+        new Request('http://localhost/crowdsec/api/dashboard/stats'),
+      );
+      const pendingDashboard = (await pendingDashboardResponse.json()) as DashboardStatsResponse;
+      expect(pendingDashboard.pending).toBe(true);
+      expect(pendingDashboard.stale).toBe(true);
+      expect(pendingDashboard.totals.alerts).toBe(1);
+
+      releaseDashboard();
+    } finally {
+      releaseDashboard();
       controller.stopBackgroundTasks();
       database.close();
     }

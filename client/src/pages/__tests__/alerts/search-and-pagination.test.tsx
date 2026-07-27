@@ -18,9 +18,10 @@ async function expandAlertSearch() {
   expect(screen.getByRole('button', { name: 'Search syntax help' })).toBeInTheDocument();
   const collapseButton = screen.getByRole('button', { name: 'Collapse search' });
   expect(collapseButton).toHaveAttribute('aria-expanded', 'true');
-  expect(collapseButton).toHaveClass('border-r-0');
-  expect(collapseButton.nextElementSibling).toContainElement(input);
-  expect(input.parentElement).toHaveClass('rounded-l-none');
+  expect(collapseButton).toHaveClass('border-l-0');
+  expect(collapseButton.previousElementSibling).toContainElement(input);
+  expect(input.parentElement).toHaveClass('rounded-r-none');
+  expect(screen.getByRole('button', { name: 'Search syntax help' }).compareDocumentPosition(input) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   expect(input.parentElement?.querySelector('.lucide-search')).toBeNull();
   return input;
 }
@@ -38,12 +39,12 @@ describe('Alerts page search and pagination', () => {
     const searchButton = screen.getByRole('button', { name: 'Expand search' });
     const filtersButton = screen.getByRole('button', { name: 'Filters' });
     const columnsButton = screen.getByRole('button', { name: 'Choose alert table columns' });
-    expect(Array.from(columnsButton.parentElement!.children).slice(0, 3)).toEqual([
-      filtersButton.parentElement!,
+    expect(columnsButton.parentElement!.firstElementChild).toBe(columnsButton);
+    expect(Array.from(columnsButton.nextElementSibling!.children)).toEqual([
       searchButton.parentElement!.parentElement!,
-      columnsButton,
+      filtersButton.parentElement!,
     ]);
-    expect(columnsButton).toHaveClass('ml-auto');
+    expect(columnsButton.nextElementSibling).toHaveClass('ml-auto');
     expect(screen.queryByPlaceholderText('Filter alerts...')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Search syntax help' })).not.toBeInTheDocument();
     await expandAlertSearch();
@@ -169,6 +170,37 @@ describe('Alerts page search and pagination', () => {
     expect(hiddenColumns).not.toBeNull();
     expect(within(hiddenColumns!).getByRole('button', { name: 'Date and time' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Target' })).toBeInTheDocument();
+  });
+
+  test('filters live and simulation alerts from the quick-filter drawer', async () => {
+    const fetchAlertsPaginatedMock = vi.mocked(api.fetchAlertsPaginated);
+    fetchAlertsPaginatedMock.mockClear();
+    render(
+      <MemoryRouter initialEntries={['/alerts']}>
+        <Alerts />
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Filters' }));
+    const drawer = screen.getByRole('dialog', { name: 'Quick filters' });
+    const scenario = within(drawer).getByRole('button', { name: 'Scenario' });
+    const mode = within(drawer).getByRole('button', { name: 'Mode' });
+    expect(scenario.compareDocumentPosition(mode) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await userEvent.click(mode);
+    expect(within(drawer).queryByRole('checkbox', { name: /All/ })).not.toBeInTheDocument();
+    await userEvent.click(within(drawer).getByRole('checkbox', { name: 'Toggle Live in Mode' }));
+    await waitFor(() => expect(fetchAlertsPaginatedMock.mock.calls.at(-1)?.[2]).toMatchObject({
+      q: 'sim=simulated',
+    }));
+    expect(within(screen.getByRole('button', { name: 'Filters' })).getByText('1')).toBeInTheDocument();
+
+    await userEvent.click(within(drawer).getByRole('checkbox', { name: 'Toggle Live in Mode' }));
+    await waitFor(() => expect(fetchAlertsPaginatedMock.mock.calls.at(-1)?.[2]?.q).toBeUndefined());
+    await userEvent.click(within(drawer).getByRole('checkbox', { name: 'Toggle Simulation in Mode' }));
+    await waitFor(() => expect(fetchAlertsPaginatedMock.mock.calls.at(-1)?.[2]).toMatchObject({
+      q: 'sim=live',
+    }));
   });
 
   test('lists the target quick filter below visible filters when the target column is hidden', async () => {

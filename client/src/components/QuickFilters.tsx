@@ -13,6 +13,7 @@ import {
     X,
 } from 'lucide-react';
 import { fetchFacet } from '../lib/api';
+import { getBrowserTimeZone, useDateTime } from '../lib/dateTime';
 import { useI18n } from '../lib/i18n';
 import {
     getSearchFacetSelection,
@@ -21,6 +22,7 @@ import {
     type SearchNode,
 } from '../../../shared/search';
 import type { FacetField, FacetValue } from '../types';
+import type { QuickFilterSimulationValue } from '../lib/quickFilters';
 
 export interface QuickFilterDefinition {
     field: FacetField;
@@ -29,7 +31,12 @@ export interface QuickFilterDefinition {
     applicable?: boolean;
 }
 
-export type QuickFilterSectionId = FacetField | 'date';
+export type QuickFilterSectionId = FacetField | 'date' | 'simulation';
+
+interface QuickFilterSimulation {
+    value: QuickFilterSimulationValue;
+    onChange: (value: QuickFilterSimulationValue) => void;
+}
 
 interface QuickFiltersProps {
     page: 'alerts' | 'decisions';
@@ -43,6 +50,8 @@ interface QuickFiltersProps {
     dateRange: SearchDateRange;
     onDateRangeChange: (range: SearchDateRange) => void;
     onClearAll: () => void;
+    lookbackHours?: number;
+    simulation?: QuickFilterSimulation;
     getSelection?: (field: FacetField, selection: SearchFacetSelection) => SearchFacetSelection;
     formatValue?: (field: FacetField, value: string) => string;
     getSearchValues?: (field: FacetField, search: string) => string[];
@@ -63,6 +72,8 @@ export function QuickFilters({
     dateRange,
     onDateRangeChange,
     onClearAll,
+    lookbackHours = 168,
+    simulation,
     getSelection,
     formatValue,
     getSearchValues,
@@ -72,7 +83,7 @@ export function QuickFilters({
 }: QuickFiltersProps) {
     const { t } = useI18n();
     const [drawerOpen, setDrawerOpen] = useState(false);
-    const [openFields, setOpenFields] = useState<Set<FacetField | 'date'>>(() => new Set());
+    const [openFields, setOpenFields] = useState<Set<QuickFilterSectionId>>(() => new Set());
     const triggerRef = useRef<HTMLButtonElement>(null);
     const drawerRef = useRef<HTMLDivElement>(null);
     const closeButtonRef = useRef<HTMLButtonElement>(null);
@@ -83,12 +94,15 @@ export function QuickFilters({
             getSearchFacetSelection(searchAst, definition.field),
         ) ?? getSearchFacetSelection(searchAst, definition.field);
         return count + getActiveSelectionCount(definition, selection);
-    }, Number(Boolean(dateRange.start)) + Number(Boolean(dateRange.end))), [
+    }, Number(Boolean(dateRange.start))
+        + Number(Boolean(dateRange.end))
+        + getSimulationActiveCount(simulation?.value)), [
         dateRange.end,
         dateRange.start,
         fields,
         getSelection,
         searchAst,
+        simulation?.value,
     ]);
 
     useEffect(() => {
@@ -127,7 +141,7 @@ export function QuickFilters({
         };
     }, [drawerOpen]);
 
-    const toggleField = (field: FacetField | 'date') => {
+    const toggleField = (field: QuickFilterSectionId) => {
         setOpenFields((current) => {
             const next = new Set(current);
             if (next.has(field)) next.delete(field);
@@ -147,6 +161,8 @@ export function QuickFilters({
             searchAst={searchAst}
             dateRange={dateRange}
             onDateRangeChange={onDateRangeChange}
+            lookbackHours={lookbackHours}
+            simulation={simulation}
             openFields={openFields}
             enabled={enabled && !busy}
             onToggleField={toggleField}
@@ -240,9 +256,9 @@ export function QuickFilters({
 }
 
 interface FacetGroupsProps extends Omit<QuickFiltersProps, 'busy' | 'onClearAll'> {
-    openFields: Set<FacetField | 'date'>;
+    openFields: Set<QuickFilterSectionId>;
     enabled: boolean;
-    onToggleField: (field: FacetField | 'date') => void;
+    onToggleField: (field: QuickFilterSectionId) => void;
 }
 
 function FacetGroups({
@@ -255,6 +271,8 @@ function FacetGroups({
     searchAst,
     dateRange,
     onDateRangeChange,
+    lookbackHours = 168,
+    simulation,
     openFields,
     enabled,
     onToggleField,
@@ -266,8 +284,14 @@ function FacetGroups({
 }: FacetGroupsProps) {
     const { t } = useI18n();
     const definitions = new Map(fields.map((definition) => [definition.field, definition]));
-    const orderedSections: QuickFilterSectionId[] = sectionOrder
-        ?? ['date', ...fields.map((definition) => definition.field)];
+    const orderedSections = addSimulationAfterScenario(
+        sectionOrder ?? ['date', ...fields.map((definition) => definition.field)],
+        Boolean(simulation),
+    );
+    const orderedHiddenSections = addSimulationAfterScenario(
+        hiddenSectionOrder,
+        Boolean(simulation),
+    );
 
     return (
         <div>
@@ -278,6 +302,8 @@ function FacetGroups({
                     searchAst,
                     dateRange,
                     onDateRangeChange,
+                    lookbackHours,
+                    simulation,
                     openFields,
                     enabled,
                     onToggleField,
@@ -288,7 +314,7 @@ function FacetGroups({
                     refreshKey,
                 })}
             </div>
-            {hiddenSectionOrder.length > 0 && (
+            {orderedHiddenSections.length > 0 && (
                 <section
                     className="mt-4 border-t border-gray-300 pt-4 dark:border-gray-600"
                     aria-labelledby="quick-filters-hidden-columns-title"
@@ -300,12 +326,14 @@ function FacetGroups({
                         {t('components.quickFilters.hiddenColumns')}
                     </h3>
                     <div className="divide-y divide-gray-200 dark:divide-gray-700">
-                        {renderFilterGroups(hiddenSectionOrder, definitions, {
+                        {renderFilterGroups(orderedHiddenSections, definitions, {
                             page,
                             filters,
                             searchAst,
                             dateRange,
                             onDateRangeChange,
+                            lookbackHours,
+                            simulation,
                             openFields,
                             enabled,
                             onToggleField,
@@ -336,6 +364,8 @@ function FacetGroups({
                             searchAst,
                             dateRange,
                             onDateRangeChange,
+                            lookbackHours,
+                            simulation,
                             openFields,
                             enabled,
                             onToggleField,
@@ -358,6 +388,8 @@ interface FilterGroupRenderOptions {
     searchAst: QuickFiltersProps['searchAst'];
     dateRange: QuickFiltersProps['dateRange'];
     onDateRangeChange: QuickFiltersProps['onDateRangeChange'];
+    lookbackHours: number;
+    simulation?: QuickFiltersProps['simulation'];
     openFields: FacetGroupsProps['openFields'];
     enabled: boolean;
     onToggleField: FacetGroupsProps['onToggleField'];
@@ -382,6 +414,20 @@ function renderFilterGroups(
                     onToggle={() => options.onToggleField('date')}
                     range={options.dateRange}
                     onChange={options.onDateRangeChange}
+                    lookbackHours={options.lookbackHours}
+                />
+            );
+        }
+        if (section === 'simulation') {
+            if (!options.simulation) return null;
+            return (
+                <SimulationFilterGroup
+                    key="simulation"
+                    open={options.openFields.has('simulation')}
+                    enabled={options.enabled}
+                    value={options.simulation.value}
+                    onToggle={() => options.onToggleField('simulation')}
+                    onChange={options.simulation.onChange}
                 />
             );
         }
@@ -408,11 +454,126 @@ function renderFilterGroups(
     });
 }
 
+function addSimulationAfterScenario(
+    sections: QuickFilterSectionId[],
+    enabled: boolean,
+): QuickFilterSectionId[] {
+    if (!enabled || sections.includes('simulation')) return sections;
+    const scenarioIndex = sections.indexOf('scenario');
+    if (scenarioIndex < 0) return sections;
+    return [
+        ...sections.slice(0, scenarioIndex + 1),
+        'simulation',
+        ...sections.slice(scenarioIndex + 1),
+    ];
+}
+
+interface SimulationFilterGroupProps {
+    open: boolean;
+    enabled: boolean;
+    value: QuickFilterSimulationValue;
+    onToggle: () => void;
+    onChange: (value: QuickFilterSimulationValue) => void;
+}
+
+function SimulationFilterGroup({
+    open,
+    enabled,
+    value,
+    onToggle,
+    onChange,
+}: SimulationFilterGroupProps) {
+    const { t } = useI18n();
+    const options: Array<{ value: 'live' | 'simulated'; label: string }> = [
+        { value: 'live', label: t('common.live') },
+        { value: 'simulated', label: t('pages.dashboard.simulation') },
+    ];
+    const isChecked = (option: 'live' | 'simulated') => (
+        value === 'all' || value === option
+    );
+    const toggleOption = (option: 'live' | 'simulated') => {
+        const liveChecked = isChecked('live');
+        const simulatedChecked = isChecked('simulated');
+        const nextLiveChecked = option === 'live' ? !liveChecked : liveChecked;
+        const nextSimulatedChecked = option === 'simulated' ? !simulatedChecked : simulatedChecked;
+        if (nextLiveChecked && nextSimulatedChecked) onChange('all');
+        else if (nextLiveChecked) onChange('live');
+        else if (nextSimulatedChecked) onChange('simulated');
+        else onChange('none');
+    };
+
+    return (
+        <section className="py-1">
+            <div className="flex min-h-11 items-center gap-1">
+                <button
+                    type="button"
+                    onClick={onToggle}
+                    className="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-sm font-semibold hover:bg-gray-50 dark:hover:bg-gray-700"
+                    aria-expanded={open}
+                >
+                    <ChevronDown
+                        size={16}
+                        className={`shrink-0 transition-transform ${open ? '' : '-rotate-90'}`}
+                        aria-hidden="true"
+                    />
+                    <span className="truncate">{t('pages.dashboard.mode')}</span>
+                </button>
+                <ActiveFilterControls
+                    count={getSimulationActiveCount(value)}
+                    clearLabel={t('components.quickFilters.clearSection', {
+                        field: t('pages.dashboard.mode'),
+                    })}
+                    onClear={() => onChange('all')}
+                />
+            </div>
+            {open && (
+                <div className="pb-2 pl-2">
+                    {options.map((option) => (
+                        <div
+                            key={option.value}
+                            className="flex min-h-11 items-center rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/60"
+                        >
+                            <label className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center">
+                                <input
+                                    type="checkbox"
+                                    value={option.value}
+                                    checked={isChecked(option.value)}
+                                    disabled={!enabled}
+                                    onChange={() => toggleOption(option.value)}
+                                    aria-label={t('components.quickFilters.toggleValue', {
+                                        value: option.label,
+                                        field: t('pages.dashboard.mode'),
+                                    })}
+                                    className="h-5 w-5 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                                />
+                            </label>
+                            <button
+                                type="button"
+                                disabled={!enabled}
+                                onClick={() => onChange(option.value)}
+                                className="min-w-0 flex-1 self-stretch truncate text-left text-sm"
+                            >
+                                {option.label}
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </section>
+    );
+}
+
+function getSimulationActiveCount(value?: QuickFilterSimulationValue): number {
+    if (value === 'none') return 2;
+    return value && value !== 'all' ? 1 : 0;
+}
+
 interface DateTimeFilterGroupProps {
     open: boolean;
     onToggle: () => void;
     range: SearchDateRange;
     onChange: (range: SearchDateRange) => void;
+    lookbackHours: number;
 }
 
 function DateTimeFilterGroup({
@@ -420,11 +581,18 @@ function DateTimeFilterGroup({
     onToggle,
     range,
     onChange,
+    lookbackHours,
 }: DateTimeFilterGroupProps) {
-    const { t } = useI18n();
+    const { language, t } = useI18n();
+    const { timeZone } = useDateTime();
     const startValue = toDateTimeLocalValue(range.start);
     const endValue = toDateTimeLocalValue(range.end);
     const activeCount = Number(Boolean(range.start)) + Number(Boolean(range.end));
+    const presets = getDateTimePresets(
+        new Date(),
+        timeZone ?? getBrowserTimeZone(),
+        lookbackHours,
+    );
 
     return (
         <section className="py-1">
@@ -449,7 +617,41 @@ function DateTimeFilterGroup({
                 />
             </div>
             {open && (
-                <div className="space-y-3 px-2 pb-3">
+                <div className="space-y-4 px-2 pb-4">
+                    <fieldset>
+                        <legend className="mb-2 text-xs font-medium text-gray-600 dark:text-gray-300">
+                            {t('components.quickFilters.quickRanges')}
+                        </legend>
+                        <div className="grid grid-cols-2 gap-2">
+                            {presets.map((preset) => {
+                                const selected = toHourPrecision(range.start) === preset.start
+                                    && !range.end;
+                                return (
+                                    <button
+                                        key={preset.hours}
+                                        type="button"
+                                        aria-pressed={selected}
+                                        onClick={() => onChange({ start: preset.start, end: '' })}
+                                        className={`min-h-11 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                                            selected
+                                                ? 'border-primary-600 bg-primary-50 text-primary-700 dark:border-primary-400 dark:bg-primary-950/40 dark:text-primary-300'
+                                                : 'border-gray-300 bg-white text-gray-700 hover:border-primary-400 hover:bg-gray-50 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200 dark:hover:border-primary-500 dark:hover:bg-gray-700'
+                                        }`}
+                                    >
+                                        {formatDateTimePresetLabel(preset, language, t)}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </fieldset>
+                    <div
+                        className="flex items-center gap-3 text-xs font-medium text-gray-500 dark:text-gray-400"
+                        aria-hidden="true"
+                    >
+                        <span className="h-px flex-1 bg-gray-200 dark:bg-gray-700" />
+                        <span>{t('components.quickFilters.customRange')}</span>
+                        <span className="h-px flex-1 bg-gray-200 dark:bg-gray-700" />
+                    </div>
                     <label className="block text-xs font-medium text-gray-600 dark:text-gray-300">
                         <span className="mb-1 block">{t('components.quickFilters.from')}</span>
                         <input
@@ -461,7 +663,7 @@ function DateTimeFilterGroup({
                                 start: toHourPrecision(event.target.value),
                                 end: toHourPrecision(range.end),
                             })}
-                            className="min-h-11 w-full rounded-md border border-gray-300 bg-white px-2 text-sm outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-900"
+                            className="min-h-11 min-w-0 w-full rounded-md border border-gray-300 bg-white px-2 text-base outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 sm:text-sm dark:border-gray-600 dark:bg-gray-900"
                         />
                     </label>
                     <label className="block text-xs font-medium text-gray-600 dark:text-gray-300">
@@ -475,13 +677,114 @@ function DateTimeFilterGroup({
                                 start: toHourPrecision(range.start),
                                 end: toHourPrecision(event.target.value),
                             })}
-                            className="min-h-11 w-full rounded-md border border-gray-300 bg-white px-2 text-sm outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-900"
+                            className="min-h-11 min-w-0 w-full rounded-md border border-gray-300 bg-white px-2 text-base outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 sm:text-sm dark:border-gray-600 dark:bg-gray-900"
                         />
                     </label>
                 </div>
             )}
         </section>
     );
+}
+
+type DateTimePresetUnit = 'minute' | 'hour' | 'day';
+
+interface DateTimePreset {
+    hours: number;
+    preferredUnit?: DateTimePresetUnit;
+    start: string;
+}
+
+const DATE_TIME_PRESET_CANDIDATES = [
+    { hours: 1, preferredUnit: 'hour' },
+    { hours: 24, preferredUnit: 'hour' },
+    { hours: 48, preferredUnit: 'hour' },
+    { hours: 12, preferredUnit: 'hour' },
+    { hours: 6, preferredUnit: 'hour' },
+    { hours: 0.5, preferredUnit: 'minute' },
+    { hours: 0.25, preferredUnit: 'minute' },
+    { hours: 5 / 60, preferredUnit: 'minute' },
+    { hours: 1 / 60, preferredUnit: 'minute' },
+] as const;
+
+function getDateTimePresets(
+    now: Date,
+    timeZone: string | null,
+    configuredLookbackHours: number,
+): DateTimePreset[] {
+    const lookbackHours = Number.isFinite(configuredLookbackHours) && configuredLookbackHours > 0
+        ? configuredLookbackHours
+        : 168;
+    const shorterPresets: Array<{
+        hours: number;
+        preferredUnit?: DateTimePresetUnit;
+    }> = DATE_TIME_PRESET_CANDIDATES
+        .filter(({ hours }) => hours < lookbackHours)
+        .slice(0, 3)
+        .map((preset) => ({ ...preset }))
+        .sort((left, right) => left.hours - right.hours);
+    const durations = [...shorterPresets, { hours: lookbackHours }];
+
+    return durations.map(({ hours, preferredUnit }) => {
+        const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
+        return { hours, preferredUnit, start: formatHour(start, timeZone) };
+    });
+}
+
+function formatDateTimePresetLabel(
+    preset: Pick<DateTimePreset, 'hours' | 'preferredUnit'>,
+    language: string,
+    t: ReturnType<typeof useI18n>['t'],
+): string {
+    const unit = preset.preferredUnit ?? getDateTimePresetUnit(preset.hours);
+    const rawCount = unit === 'minute'
+        ? preset.hours * 60
+        : unit === 'day'
+            ? preset.hours / 24
+            : preset.hours;
+    const count = Math.round(rawCount);
+    const formattedCount = new Intl.NumberFormat(language).format(count);
+    const singular = count === 1;
+    const key = unit === 'minute'
+        ? singular
+            ? 'components.quickFilters.lastMinute'
+            : 'components.quickFilters.lastMinutes'
+        : unit === 'day'
+            ? singular
+                ? 'components.quickFilters.lastDay'
+                : 'components.quickFilters.lastDays'
+            : singular
+                ? 'components.quickFilters.lastHour'
+                : 'components.quickFilters.lastHours';
+    return t(key, { count: formattedCount });
+}
+
+function getDateTimePresetUnit(hours: number): DateTimePresetUnit {
+    if (!Number.isInteger(hours)) return 'minute';
+    if (hours % 24 === 0) return 'day';
+    return 'hour';
+}
+
+function formatHour(value: Date, timeZone: string | null): string {
+    if (timeZone) {
+        const parts = new Intl.DateTimeFormat('en', {
+            timeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            hourCycle: 'h23',
+        }).formatToParts(value);
+        const part = (type: Intl.DateTimeFormatPartTypes) => (
+            parts.find((candidate) => candidate.type === type)?.value ?? ''
+        );
+        return `${part('year')}-${part('month')}-${part('day')}T${part('hour')}:00`;
+    }
+
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, '0');
+    const day = String(value.getDate()).padStart(2, '0');
+    const hour = String(value.getHours()).padStart(2, '0');
+    return `${year}-${month}-${day}T${hour}:00`;
 }
 
 function toDateTimeLocalValue(value: string): string {
