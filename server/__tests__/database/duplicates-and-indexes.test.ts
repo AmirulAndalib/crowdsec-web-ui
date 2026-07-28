@@ -71,6 +71,50 @@ describe('CrowdsecDatabase duplicates and indexes', () => {
     db.close();
   });
 
+  test('journals dashboard-relevant deltas and brackets bulk rebuilds with epochs', () => {
+    const db = createTestDatabase();
+    const alert = {
+      $id: 41,
+      $uuid: 'dashboard-change-alert',
+      $created_at: '2026-07-28T12:00:00.000Z',
+      $scenario: 'crowdsecurity/http-probing',
+      $source_ip: '192.0.2.41',
+      $message: 'alert',
+      $raw_data: JSON.stringify({ id: 41, scenario: 'crowdsecurity/http-probing' }),
+    };
+
+    expect(db.insertAlert(alert)).toBe(true);
+    expect((db.db.prepare(`
+      SELECT COUNT(*) AS count FROM dashboard_record_changes WHERE table_name = 'alerts'
+    `).get() as { count: number }).count).toBe(1);
+    db.db.exec('DELETE FROM dashboard_record_changes');
+
+    expect(db.insertAlert(alert)).toBe(false);
+    expect((db.db.prepare('SELECT COUNT(*) AS count FROM dashboard_record_changes').get() as { count: number }).count).toBe(0);
+    expect(db.insertAlert({
+      ...alert,
+      $scenario: 'crowdsecurity/ssh-bf',
+      $raw_data: JSON.stringify({ id: 41, scenario: 'crowdsecurity/ssh-bf' }),
+    })).toBe(true);
+    expect((db.db.prepare('SELECT COUNT(*) AS count FROM dashboard_record_changes').get() as { count: number }).count).toBe(1);
+
+    const epochBefore = Number(db.getMeta('dashboard_change_epoch')?.value);
+    db.beginDeferredSearchIndexUpdates();
+    expect(db.getMeta('dashboard_change_tracking_enabled')?.value).toBe('false');
+    expect(db.insertAlert({
+      ...alert,
+      $id: 42,
+      $uuid: 'dashboard-change-alert-bulk',
+    })).toBe(true);
+    expect((db.db.prepare('SELECT COUNT(*) AS count FROM dashboard_record_changes').get() as { count: number }).count).toBe(0);
+    db.rebuildSearchIndexes();
+
+    expect(db.getMeta('dashboard_change_tracking_enabled')?.value).toBe('true');
+    expect(Number(db.getMeta('dashboard_change_epoch')?.value)).toBe(epochBefore + 2);
+    expect(db.getMeta('dashboard_change_floor')?.value).toBe('0');
+    db.close();
+  });
+
   test('updates duplicate flags differentially and skips unchanged rows', () => {
     const db = createTestDatabase();
     const insertDecision = (id: string, stopAt: string) => db.insertDecision({
@@ -336,6 +380,26 @@ describe('CrowdsecDatabase duplicates and indexes', () => {
     expect(filteredDecisionCountPlan.map((step) => step.detail).join('\n')).toContain(
       'USING COVERING INDEX idx_decisions_duplicate_filters (is_duplicate=? AND instance_id=? AND stop_at>?)',
     );
+    const decisionPagingPlan = db.db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT COALESCE(upstream_id, CAST(id AS TEXT)) AS id, id AS internal_id, created_at
+      FROM decisions AS decisions INDEXED BY idx_decisions_duplicate_paging
+      WHERE instance_id IN (?, ?)
+        AND stop_at > ?
+        AND is_duplicate = 0
+      ORDER BY decisions.created_at DESC, decisions.id DESC
+      LIMIT ? OFFSET ?
+    `).all(
+      'primary',
+      'secondary',
+      '2026-01-01T00:00:00.000Z',
+      50,
+      0,
+    ) as Array<{ detail: string }>;
+    expect(decisionPagingPlan.map((step) => step.detail).join('\n')).toContain(
+      'USING INDEX idx_decisions_duplicate_paging (is_duplicate=?)',
+    );
+    expect(decisionPagingPlan.map((step) => step.detail).join('\n')).not.toContain('USE TEMP B-TREE');
     const filteredDuplicateRankingPlan = db.db.prepare(`
       EXPLAIN QUERY PLAN
       WITH ranked_filtered_decisions AS (

@@ -72,12 +72,16 @@ export interface DashboardStatsFilters {
 export interface DashboardStatsCache {
   key: string;
   scope: string;
+  primaryOnly: boolean;
+  changeEpoch: number;
+  changeRevision: number;
   alerts: DashboardAlertStatsRecord[];
   decisions: DashboardDecisionStatsRecord[];
   totals: DashboardStatsTotals;
 }
 
 export interface DashboardAlertStatsRecord {
+  internalId: string | number;
   id: string | number;
   instanceId: string;
   createdAt: string;
@@ -102,6 +106,7 @@ export interface DashboardAlertStatsRecord {
 }
 
 export interface DashboardDecisionStatsRecord {
+  internalId: string | number;
   id: string | number;
   instanceId: string;
   alertId?: string | number;

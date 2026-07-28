@@ -15,6 +15,90 @@ import {
 } from './harness';
 
 describe('createApp dashboard API', () => {
+  test('serializes changing dashboard ranges and only warms the newest pending response', async () => {
+    const createdAt = new Date().toISOString();
+    const dateKey = dashboardDateKey(createdAt, 0);
+    const database = new CrowdsecDatabase({ dbPath: path.join(tempDir, 'test.db') });
+    seedAlert(database, sampleAlert({
+      id: 99,
+      uuid: 'dashboard-serialized-range-alert',
+      created_at: createdAt,
+    }));
+    const queryWorker = new DatabaseQueryWorker({ dbPath: database.dbPath });
+    const analyticsQueryWorker = new DatabaseQueryWorker({ dbPath: database.dbPath });
+    const realAll = analyticsQueryWorker.all.bind(analyticsQueryWorker);
+    let releaseFirstTotals!: () => void;
+    const firstTotalsGate = new Promise<void>((resolve) => {
+      releaseFirstTotals = resolve;
+    });
+    let firstTotalsStarted!: () => void;
+    const firstTotalsStart = new Promise<void>((resolve) => {
+      firstTotalsStarted = resolve;
+    });
+    let totalsCalls = 0;
+    let activeTotalsCalls = 0;
+    let maximumActiveTotalsCalls = 0;
+    vi.spyOn(analyticsQueryWorker, 'all').mockImplementation(async (sql, params, options) => {
+      if (options?.label === 'dashboard alert totals') {
+        totalsCalls += 1;
+        activeTotalsCalls += 1;
+        maximumActiveTotalsCalls = Math.max(maximumActiveTotalsCalls, activeTotalsCalls);
+        try {
+          if (totalsCalls === 1) {
+            firstTotalsStarted();
+            await Promise.race([
+              firstTotalsGate,
+              new Promise<void>((_resolve, reject) => {
+                options.signal?.addEventListener('abort', () => {
+                  const error = new Error('Database query aborted');
+                  error.name = 'AbortError';
+                  reject(error);
+                }, { once: true });
+              }),
+            ]);
+          }
+          return await realAll(sql, params, options);
+        } finally {
+          activeTotalsCalls -= 1;
+        }
+      }
+      return realAll(sql, params, options);
+    });
+    const { controller } = createController({
+      database,
+      queryWorker,
+      analyticsQueryWorker,
+      initialCacheState: {
+        isInitialized: true,
+        isComplete: true,
+        lastUpdate: createdAt,
+      },
+    });
+
+    try {
+      const firstRequest = controller.fetch(new Request(
+        `http://localhost/crowdsec/api/dashboard/stats?dateStart=${dateKey}&dateEnd=${dateKey}`,
+      ));
+      await firstTotalsStart;
+
+      const pendingResponse = await controller.fetch(new Request(
+        `http://localhost/crowdsec/api/dashboard/stats?granularity=hour&dateStart=${dateKey}&dateEnd=${dateKey}`,
+      ));
+      expect(await pendingResponse.json()).toEqual(expect.objectContaining({ pending: true }));
+
+      releaseFirstTotals();
+      expect((await firstRequest).status).toBe(200);
+      await vi.waitFor(() => expect(totalsCalls).toBe(2));
+      await vi.waitFor(() => expect(activeTotalsCalls).toBe(0));
+      expect(maximumActiveTotalsCalls).toBe(1);
+    } finally {
+      releaseFirstTotals();
+      controller.stopBackgroundTasks();
+      database.close();
+      destroyTempDir();
+    }
+  });
+
   test('handles an analytics timeout immediately while dashboard enrichment is still pending', async () => {
     const database = new CrowdsecDatabase({ dbPath: path.join(tempDir, 'test.db') });
     seedAlert(database, sampleAlert());
@@ -433,13 +517,102 @@ describe('createApp dashboard API', () => {
     destroyTempDir();
   });
 
+  test('keeps initial history sync active until the requested dashboard is warmed', async () => {
+    const alert = sampleAlert({
+      id: 303,
+      uuid: 'dashboard-alert-303',
+      created_at: new Date().toISOString(),
+    });
+    const database = new CrowdsecDatabase({ dbPath: path.join(tempDir, 'test.db') });
+    const analyticsQueryWorker = new DatabaseQueryWorker({ dbPath: database.dbPath });
+    const realAll = analyticsQueryWorker.all.bind(analyticsQueryWorker);
+    let releaseHistory!: () => void;
+    const historyGate = new Promise<void>((resolve) => {
+      releaseHistory = resolve;
+    });
+    let releaseWarmup!: () => void;
+    const warmupGate = new Promise<void>((resolve) => {
+      releaseWarmup = resolve;
+    });
+    let warmupStarted!: () => void;
+    const warmupStart = new Promise<void>((resolve) => {
+      warmupStarted = resolve;
+    });
+    let historyReleased = false;
+    let dateNowSpy: { mockRestore: () => void } | null = null;
+    vi.spyOn(analyticsQueryWorker, 'all').mockImplementation(async (sql, params, options) => {
+      if (historyReleased && options?.label === 'dashboard alert totals') {
+        warmupStarted();
+        await warmupGate;
+      }
+      return realAll(sql, params, options);
+    });
+    const { controller } = createController({
+      database,
+      analyticsQueryWorker,
+      env: { CROWDSEC_REFRESH_INTERVAL: '5s' },
+      fetchResolver: (url) => {
+        if (!url.includes('/v1/alerts?')) return undefined;
+        return historyGate.then(() => Response.json([alert]));
+      },
+    });
+
+    try {
+      controller.startBackgroundTasks();
+      await vi.waitFor(() => expect(controller.getSyncStatus().isSyncing).toBe(true));
+
+      const initialDashboardResponse = await controller.fetch(new Request(
+        'http://localhost/crowdsec/api/dashboard/stats?granularity=hour',
+      ));
+      expect(initialDashboardResponse.status).toBe(200);
+
+      const requestTime = Date.now();
+      dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(requestTime + 11_000);
+      historyReleased = true;
+      releaseHistory();
+      await warmupStart;
+      expect(controller.getSyncStatus()).toEqual(expect.objectContaining({
+        isSyncing: true,
+        progress: 99,
+        message: 'Preparing dashboard data for faster loading...',
+        completedAt: null,
+      }));
+
+      releaseWarmup();
+      await vi.waitFor(() => expect(controller.getSyncStatus()).toEqual(expect.objectContaining({
+        isSyncing: false,
+        progress: 100,
+        completedAt: expect.any(String),
+      })));
+
+      const readyResponse = await controller.fetch(new Request(
+        'http://localhost/crowdsec/api/dashboard/stats?granularity=hour',
+      ));
+      const readyDashboard = await readyResponse.json() as DashboardStatsResponse;
+      expect(readyDashboard.pending).toBeUndefined();
+      expect(readyDashboard.totals.alerts).toBe(1);
+    } finally {
+      dateNowSpy?.mockRestore();
+      releaseHistory();
+      releaseWarmup();
+      controller.stopBackgroundTasks();
+      database.close();
+      destroyTempDir();
+    }
+  });
+
   test('serves a fresh dashboard snapshot on the first request after invalidation', async () => {
     const alert = sampleAlert({
       id: 302,
       uuid: 'dashboard-alert-302',
       created_at: new Date().toISOString(),
     });
-    const { controller, database } = createController({
+    const database = new CrowdsecDatabase({ dbPath: path.join(tempDir, 'test.db') });
+    const analyticsQueryWorker = new DatabaseQueryWorker({ dbPath: database.dbPath });
+    const analyticsAllSpy = vi.spyOn(analyticsQueryWorker, 'all');
+    const { controller } = createController({
+      database,
+      analyticsQueryWorker,
       initialCacheState: {
         isInitialized: true,
         isComplete: true,
@@ -451,6 +624,7 @@ describe('createApp dashboard API', () => {
 
     const initialResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/dashboard/stats'));
     expect((await initialResponse.json() as DashboardStatsResponse).totals.alerts).toBe(1);
+    analyticsAllSpy.mockClear();
 
     const deleteResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts/302', {
       method: 'DELETE',
@@ -464,6 +638,10 @@ describe('createApp dashboard API', () => {
     expect(readyPayload).toEqual(expect.objectContaining({
       totals: expect.objectContaining({ alerts: 0 }),
     }));
+    expect(analyticsAllSpy.mock.calls.some(([, , options]) => options?.label === 'dashboard alert delta')).toBe(true);
+    expect(analyticsAllSpy.mock.calls.some(([, , options]) => (
+      options?.label === 'dashboard alert index' || options?.label === 'dashboard decision index'
+    ))).toBe(false);
 
     controller.stopBackgroundTasks();
     database.close();
