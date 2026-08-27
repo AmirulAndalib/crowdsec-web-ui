@@ -54,6 +54,7 @@ export interface InstanceEntityRef {
 export interface PrometheusEndpointSummary {
   id: string;
   name: string;
+  icon?: string;
 }
 
 export interface InstanceSummary {
@@ -422,6 +423,8 @@ export interface NotificationFilter {
   target?: string;
   include_simulated?: boolean;
   values?: string[];
+  countries?: string[];
+  exclude_countries?: boolean;
 }
 
 export interface AlertSpikeRuleConfig {
@@ -588,6 +591,7 @@ export interface CrowdsecMetricsRouteActivity {
 }
 
 export interface CrowdsecMetricsApiEntity {
+  source_id?: string;
   name: string;
   requests: number;
   topRoute: string | null;
@@ -603,6 +607,7 @@ export interface CrowdsecMetricsApiEntity {
 }
 
 export interface CrowdsecMetricsParserSource {
+  source_id?: string;
   source: string;
   type: string;
   acquisTypes: string[];
@@ -616,6 +621,7 @@ export interface CrowdsecMetricsParserSource {
 }
 
 export interface CrowdsecMetricsParserNode {
+  source_id?: string;
   name: string;
   stage: string;
   source: string;
@@ -629,6 +635,7 @@ export interface CrowdsecMetricsParserNode {
 }
 
 export interface CrowdsecMetricsTiming {
+  source_id?: string;
   source: string;
   type: string;
   count: number;
@@ -636,6 +643,7 @@ export interface CrowdsecMetricsTiming {
 }
 
 export interface CrowdsecMetricsWhitelist {
+  source_id?: string;
   name: string;
   reason: string;
   hits: number;
@@ -643,6 +651,7 @@ export interface CrowdsecMetricsWhitelist {
 }
 
 export interface CrowdsecMetricsLapiRoute {
+  source_id?: string;
   method: string;
   route: string;
   requests: number;
@@ -650,6 +659,7 @@ export interface CrowdsecMetricsLapiRoute {
 }
 
 export interface CrowdsecMetricsAppsecEngine {
+  source_id?: string;
   engine: string;
   source: string;
   requests: number;
@@ -658,6 +668,7 @@ export interface CrowdsecMetricsAppsecEngine {
 }
 
 export interface CrowdsecMetricsScenario {
+  source_id?: string;
   name: string;
   current: number;
   instantiations: number;
@@ -667,10 +678,31 @@ export interface CrowdsecMetricsScenario {
   poured: number;
 }
 
+export interface CrowdsecMetricsSource {
+  id: string;
+  instance_id: string;
+  instance_name: string;
+  instance_icon?: string;
+  endpoint_id: string;
+  endpoint_name: string;
+  endpoint_icon?: string;
+  status: 'available' | 'unavailable';
+  error?: string;
+  fetched_at?: string;
+  crowdsecVersion?: string | null;
+  crowdsecStartedAt?: string | null;
+}
+
+export interface CrowdsecMetricsAggregation {
+  partial: boolean;
+  sources: CrowdsecMetricsSource[];
+}
+
 export interface CrowdsecMetricsResponse {
   fetched_at: string;
   crowdsecVersion?: string | null;
   crowdsecStartedAt?: string | null;
+  aggregation?: CrowdsecMetricsAggregation;
   totals: {
     bouncerRequests: number;
     machineRequests: number;
