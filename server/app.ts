@@ -52,6 +52,7 @@ import type { MqttPublishConfig } from './notifications/mqtt-client';
 import { createNotificationOutboundGuard } from './notifications/outbound-guard';
 import { createNotificationSecretStore } from './notifications/secret-store';
 import { createUpdateChecker, type UpdateCheckOverrides, type UpdateChecker } from './update-check';
+import { createCrowdsecUpdateChecker, type CrowdsecUpdateChecker } from './crowdsec-update-check';
 import { getServerTranslator, normalizeLanguagePreference, saveLanguagePreference } from './i18n';
 import {
   addDashboardAttackLocation,
@@ -64,6 +65,7 @@ import { parseGoDuration, toDuration } from './utils/duration';
 import { fetchCrowdsecMetrics, fetchCrowdsecMetricsSamples, summarizeCrowdsecMetrics } from './metrics';
 import { DatabaseQueryWorker, QueryWorkerTimeoutError } from './query-worker-client';
 import { registerApiRoutes } from './app/api-routes';
+import { registerSavedFilterRoutes } from './app/saved-filters';
 import { createQueryService } from './app/query-service';
 import { createDeletionService } from './app/deletion-service';
 import { createSyncService } from './app/sync-service';
@@ -198,6 +200,7 @@ export interface CreateAppOptions {
   distRoot?: string;
   startBackgroundTasks?: boolean;
   updateChecker?: UpdateChecker;
+  crowdsecUpdateChecker?: CrowdsecUpdateChecker;
   notificationFetchImpl?: FetchLike;
   metricsFetchImpl?: FetchLike;
   mqttPublishImpl?: (config: MqttPublishConfig, payload: string) => Promise<void>;
@@ -426,6 +429,11 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     version: config.version,
     enabled: config.updateCheckEnabled,
   });
+  const checkCrowdsecUpdates = options.crowdsecUpdateChecker || createCrowdsecUpdateChecker({
+    instances: config.instances,
+    prometheusTimeoutMs: config.prometheusRequestTimeoutMs,
+    metricsFetchImpl: options.metricsFetchImpl,
+  });
   const notificationSecretKey = resolveNotificationSecretKey(database, config.notificationSecretKey);
   const notificationSecretStore = createNotificationSecretStore(notificationSecretKey);
   const notificationOutboundGuard = createNotificationOutboundGuard({
@@ -460,6 +468,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     fetchImpl: options.notificationFetchImpl,
     mqttPublishImpl: options.mqttPublishImpl,
     updateChecker: checkForUpdates,
+    crowdsecUpdateChecker: checkCrowdsecUpdates,
     getLapiStatus: () => lapiClient.getStatus(),
     ...(config.instances.length > 1 ? {
       getLapiStatuses: () => config.instances.map((instance) => ({
@@ -473,6 +482,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     debugPayloads: config.notificationDebugPayloads,
     timeZone: config.timeZone,
     timeFormat: config.timeFormat,
+    dateFormat: config.dateFormat,
     instanceAware: config.instances.length > 1,
     instances: config.instances.map((instance) => ({ id: instance.id, name: instance.name })),
   });
@@ -839,6 +849,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
   Notification Private Destinations: ${config.notificationAllowPrivateAddresses ? 'Allowed' : 'Blocked'}
   Time Zone: ${config.timeZone || 'Browser local'}
   Time Format: ${config.timeFormat}
+  Date Format: ${config.dateFormat}
   Dashboard Auth: ${dashboardAuth.enabled ? 'Enabled' : 'Disabled'}
   Dashboard OIDC: ${dashboardAuth.oidcEnabled ? 'Enabled' : 'Disabled'}
   Read-only Mode: ${config.readOnly ? 'Enabled' : 'Disabled'}
@@ -1217,6 +1228,13 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     app.get(`${config.basePath}/api/health`, healthHandler);
   }
   dashboardAuth.registerRoutes(app);
+  registerSavedFilterRoutes({
+    app,
+    basePath: config.basePath,
+    database,
+    auth: dashboardAuth,
+    writeDatabase: (operation) => syncWorker.runExclusive(operation),
+  });
 
   const ensureCanManageEnforcement = (context: HonoContext) => {
     if (dashboardAuth.getPermissions(context).can_manage_enforcement) return null;

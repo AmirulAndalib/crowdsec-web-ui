@@ -36,21 +36,25 @@ A self-hosted dashboard for [CrowdSec](https://crowdsec.net/): investigate alert
 | Notifications | Alert, decision, CVE, availability, and update rules delivered through Email, Gotify, MQTT, ntfy, or Webhooks |
 | Security | Initial administrator setup, password and TOTP login, passkeys, OIDC SSO, group roles, and instance-wide read-only mode |
 | Localization | Arabic, Chinese, English, French, German, Hindi, Japanese, Portuguese, Russian, and Spanish |
-| Experience | Unified search, dark/light themes, and responsive layouts |
+| Experience | Unified search, server-synced saved and recent filters, dark/light themes, and responsive layouts |
 
 ### Screenshots
 
 <p>
   <a href="screenshots/dashboard.png"><img src="screenshots/dashboard.png" alt="Dashboard" width="48%"></a>
-  <a href="screenshots/multi_instance.png"><img src="screenshots/multi_instance.png" alt="Combined multi-instance alerts" width="48%"></a>
+  <a href="screenshots/metrics.png"><img src="screenshots/metrics.png" alt="Runtime Metrics" width="48%"></a>
 </p>
 <p>
+  <a href="screenshots/multi_instance.png"><img src="screenshots/multi_instance.png" alt="Combined multi-instance alerts" width="48%"></a>
   <a href="screenshots/alerts.png"><img src="screenshots/alerts.png" alt="Alerts" width="48%"></a>
-  <a href="screenshots/quick_filters.png"><img src="screenshots/quick_filters.png" alt="Quick filters applied to alerts" width="48%"></a>
 </p>
 <p>
   <a href="screenshots/alert_details.png"><img src="screenshots/alert_details.png" alt="Alert details with CrowdSec context" width="48%"></a>
   <a href="screenshots/search_syntax.png"><img src="screenshots/search_syntax.png" alt="Search Syntax" width="48%"></a>
+</p>
+<p>
+  <a href="screenshots/quick_filters.png"><img src="screenshots/quick_filters.png" alt="Quick filters applied to alerts" width="48%"></a>
+  <a href="screenshots/saved_filters.png"><img src="screenshots/saved_filters.png" alt="Saved and recently used filters" width="48%"></a>
 </p>
 <p>
   <a href="screenshots/decisions.png"><img src="screenshots/decisions.png" alt="Decisions" width="48%"></a>
@@ -60,8 +64,7 @@ A self-hosted dashboard for [CrowdSec](https://crowdsec.net/): investigate alert
   <a href="screenshots/notifications.png"><img src="screenshots/notifications.png" alt="Notification Center" width="48%"></a>
   <a href="screenshots/notification_rule.png"><img src="screenshots/notification_rule.png" alt="Notification Rule" width="48%"></a>
 </p>
-<p>
-  <a href="screenshots/metrics.png"><img src="screenshots/metrics.png" alt="Runtime Metrics" width="48%"></a>
+<p align="center">
   <a href="screenshots/settings.png"><img src="screenshots/settings.png" alt="Settings" width="48%"></a>
 </p>
 
@@ -221,8 +224,11 @@ Use `CONFIG_FILE` only to select another existing file. [`config.example.yaml`](
 | `storage.journalSizeLimit` | `128MiB` | Retained WAL size after checkpoints. This does not cap transactions; use `unlimited` to disable trimming. Ignored when WAL is disabled. | `CONFIG_STORAGE_JOURNAL_SIZE_LIMIT` |
 | `ui.timeZone` | `browser` | Browser timezone or an IANA zone such as `Europe/Berlin` or `UTC`. | `CONFIG_UI_TIME_ZONE` |
 | `ui.timeFormat` | `browser` | Clock format: `browser`, `12h`, or `24h`. | `CONFIG_UI_TIME_FORMAT` |
+| `ui.dateFormat` | `browser` | Browser date format or a custom pattern such as `dd/mm/yyyy`, `mm/dd/yyyy`, or `yyyy-MM-dd`. | `CONFIG_UI_DATE_FORMAT` |
 | `ui.readOnly` | `false` | Hides management actions and rejects mutating API operations. | `CONFIG_UI_READ_ONLY` |
 | `updates.enabled` | `true` in packaged images | Enables the built-in update check. | `CONFIG_UPDATES_ENABLED` |
+
+Date patterns require one day, month, and year token in any order: `d`/`dd` (day), `m`/`mm` (numeric month), `mmm`/`mmmm` (localized month name), and `yy`/`yyyy` (year). Punctuation and spaces are literal; wrap words in single quotes, for example `d 'of' mmmm yyyy`. Date patterns affect full dates and timestamps; compact chart labels keep their own display format. Set `ui.timeFormat` separately for a 12 or 24 hour clock.
 
 ### Authentication
 
@@ -787,6 +793,12 @@ Dashboard applies the shared fields `Country`, `Scenario`, `Kind`, `AS`, `IP / R
 
 Active decisions are deduplicated by instance, value, and simulation mode. When filters exclude the globally preferred decision, the best matching decision is promoted so enabling **Hide duplicates** cannot make an otherwise matching duplicate group disappear.
 
+### Saved and Recent Filters
+
+Use the bookmark button beside search on Dashboard, Alerts, or Decisions to save the current valid query under a name. The menu lets you apply, rename, and delete saved filters, reuse the five most recently used queries, or clear recent history. Queries are shared across these pages; **Apply** is disabled when a query is not valid for the current page. Applying one changes the search query while keeping the selected instance and other page settings.
+
+Saved filters and recent history are stored on the server for the signed-in user, so they are available on other devices. Read-only users can manage their own filters. If authentication is disabled, everyone using the installation shares one list. Valid nonempty queries enter recent history after a brief pause, including searches opened from bookmarked URLs. Quick Filter queries enter recent history only after the Quick Filters drawer closes.
+
 ### Search Syntax
 
 | Syntax | Example |
@@ -864,7 +876,7 @@ Rules run against locally cached CrowdSec data, create in-app notifications, rec
 
 ### Rules
 
-Every rule has a name, severity (`info`, `warning`, `critical`), incident deduplication, and destination channels. Alert rules filter scenario, target, and simulation state; `IP Ban` and `New Alert/Decision` also accept exact IP/CIDR filters.
+Every rule has a name, severity (`info`, `warning`, `critical`), incident deduplication, and destination channels. Alert rules filter scenario, target, and simulation state; the scenario filter can include or exclude matching names. `IP Ban` and `New Alert/Decision` also accept exact IP/CIDR filters. `Window Minutes` sets the rolling lookback for each rule evaluation; `Alert Spike` also compares it with the preceding period of equal length. It does not set how often rules are evaluated.
 
 | Rule type | Behavior |
 | --- | --- |
@@ -883,12 +895,15 @@ Every rule has a name, severity (`info`, `warning`, `critical`), incident dedupl
 | Aggregate matching alerts across instances | `Alert Spike`, `Alert Threshold`, `Recent CVE` |
 | Evaluate each matching record | `New Alert/Decision`, `IP Ban` |
 | Evaluate each instance | `LAPI Availability` |
+| Evaluate each Prometheus endpoint | `CrowdSec Update` |
 | Application-wide | `Application Update` |
 
 Instance-backed titles and metadata identify the contributing instance or instances.
 
 > [!NOTE]
 > The `Recent CVE` rule queries the NVD API to determine when a CVE was published. If outbound access to `services.nvd.nist.gov` is blocked, recent-CVE notifications may be skipped.
+>
+> The `CrowdSec Update` rule requires a configured Prometheus endpoint with a `cs_info` version metric and outbound access to the CrowdSec GitHub release API. It checks the latest stable release and notifies once per outdated endpoint and target version.
 
 ### Destinations
 

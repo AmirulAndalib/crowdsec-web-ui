@@ -67,6 +67,21 @@ Date range filters use `dateStart` and `dateEnd`. Use `YYYY-MM-DD` for day bucke
 - Decision creation and cleanup accept `scope: "all"` or `scope: "instance"`. The latter also requires `instance_id`; omitting `scope` targets the primary instance.
 - Multi-instance writes return per-instance `results`, `succeeded`, and `failed`. Partial success returns HTTP `207`.
 
+### Saved and Recent Search Filters
+
+Saved and recent filter queries are stored in SQLite for the current session user. When authentication is disabled, all clients share one installation-wide list. Read-only users may manage their own filters. Queries are validated against the alert or decision search syntax before storage; each page only applies queries compatible with its search.
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| GET | `/api/search-filters` | Return `{ saved, recent, shared }` for the current owner. |
+| POST | `/api/search-filters/saved` | Create a named filter with `{ "name": string, "query": string }`; returns the entry. Names are unique per owner (case-insensitive). |
+| PATCH | `/api/search-filters/saved/:id` | Rename an owned filter with `{ "name": string }`. |
+| DELETE | `/api/search-filters/saved/:id` | Delete an owned filter. |
+| POST | `/api/search-filters/recent` | Record a used query with `{ "query": string }`; returns the latest five distinct queries. |
+| DELETE | `/api/search-filters/recent` | Clear the current owner's recent queries. |
+
+Names are limited to 80 characters, queries to 4096 characters, and named filters to 100 per owner. Invalid input returns `400`, duplicate names or a full named list return `409`, and missing or unowned IDs return `404`.
+
 ## Health
 
 | Method | Endpoint | Description |
@@ -256,10 +271,15 @@ Notification configuration routes manage destinations and rule definitions.
 | POST | `/api/notification-channels` | Create a notification channel. Blocked in read-only mode. |
 | PUT | `/api/notification-channels/:id` | Update a notification channel. Blocked in read-only mode. |
 | DELETE | `/api/notification-channels/:id` | Delete a notification channel. Blocked in read-only mode. |
-| POST | `/api/notification-channels/:id/test` | Send a test notification through a saved channel. Blocked in read-only mode. |
+| POST | `/api/notification-channels/:id/test` | Send a test notification through a saved channel and return its title, message, and delivery result. Blocked in read-only mode. |
 | POST | `/api/notification-rules` | Create a notification rule. Blocked in read-only mode. |
+| POST | `/api/notification-rules/:id/test` | Send one test notification through the saved rule's enabled destinations. Blocked in read-only mode. |
 | PUT | `/api/notification-rules/:id` | Update a notification rule. Blocked in read-only mode. |
 | DELETE | `/api/notification-rules/:id` | Delete a notification rule. Blocked in read-only mode. |
+
+Destination tests return `success: true`, the sent `title` and `message`, and a `delivery` result. This lets the UI show the same result details as rule tests.
+
+Rule tests return `source: "current"` when a rule matches current data, or `source: "sample"` when a synthetic example is used. The response includes the exact sent `title` and `message` and a `deliveries` result for each enabled destination. A sample checks rendering and delivery but does not verify filters or thresholds. Test sends are marked `[TEST]` and do not create notifications or incident state. A rule with no enabled outbound destinations cannot be tested.
 
 Channel create/update body:
 
@@ -287,7 +307,7 @@ Rule create/update body:
 }
 ```
 
-Supported rule types: `alert-spike`, `alert-threshold`, `new-alert-decision`, `new-cve`, `ip-ban`, `application-update`, `lapi-availability`.
+Supported rule types: `alert-spike`, `alert-threshold`, `new-alert-decision`, `new-cve`, `ip-ban`, `application-update`, `crowdsec-update`, `lapi-availability`. The `crowdsec-update` rule has an empty config and checks each configured Prometheus endpoint against the latest stable CrowdSec release.
 
 Supported severities: `info`, `warning`, `critical`.
 

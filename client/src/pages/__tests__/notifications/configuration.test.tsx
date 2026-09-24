@@ -3,7 +3,7 @@ import { describe, expect, test, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Notifications } from '../../Notifications';
-import { createNotificationRule, fetchConfig, fetchNotificationSettings, fetchNotificationsPaginated, markNotificationRead } from '../../../lib/api';
+import { createNotificationChannel, createNotificationRule, fetchConfig, fetchNotificationSettings, fetchNotificationsPaginated, markNotificationRead } from '../../../lib/api';
 
 describe('Notifications page configuration', () => {
   test('hides notification management controls when read-only but keeps mark-read available', async () => {
@@ -76,10 +76,61 @@ describe('Notifications page configuration', () => {
     expect(screen.queryByRole('button', { name: 'Edit destination' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Delete destination' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Edit rule' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send rule test' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Delete rule' })).not.toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'Mark read' }));
     await waitFor(() => expect(markNotificationRead).toHaveBeenCalledWith('notif-1'));
+  });
+
+  test('generates an editable rule name from the current type and positive filters', async () => {
+    const user = userEvent.setup();
+    render(<Notifications />);
+
+    await user.click(await screen.findByRole('button', { name: 'Add Rule' }));
+    const name = screen.getByRole('textbox', { name: 'Name' });
+    const generate = screen.getByRole('button', { name: 'Generate name' });
+    expect(name).toHaveValue('');
+
+    await user.click(generate);
+    expect(name).toHaveValue('Monitored traffic');
+
+    await user.selectOptions(screen.getByLabelText('Rule Type'), 'ip-ban');
+    await user.type(screen.getByLabelText('Country Filter (ISO Codes)'), 'DE');
+    await user.click(generate);
+    expect(name).toHaveValue('Monitored IPs · DE');
+
+    await user.clear(name);
+    await user.type(name, 'My custom name');
+    expect(name).toHaveValue('My custom name');
+
+    await user.selectOptions(screen.getByLabelText('Rule Type'), 'application-update');
+    await user.click(generate);
+    expect(name).toHaveValue('Web UI releases');
+  });
+
+  test('generates editable destination names from the type and configured endpoint', async () => {
+    const user = userEvent.setup();
+    render(<Notifications />);
+
+    await user.click(await screen.findByRole('button', { name: 'Add Destination' }));
+    const name = screen.getByRole('textbox', { name: 'Name' });
+    const generate = screen.getByRole('button', { name: 'Generate name' });
+    await user.click(generate);
+    expect(name).toHaveValue('ntfy alerts');
+
+    await user.type(screen.getByLabelText('Topic'), 'security-alerts');
+    await user.click(generate);
+    expect(name).toHaveValue('ntfy alerts · security-alerts');
+
+    await user.selectOptions(screen.getByLabelText('Type'), 'webhook');
+    await user.type(screen.getByLabelText('URL'), 'https://hooks.example.com/notify');
+    await user.click(generate);
+    expect(name).toHaveValue('Webhook events · hooks.example.com/notify');
+
+    await user.clear(name);
+    await user.type(name, 'My webhook');
+    expect(name).toHaveValue('My webhook');
   });
 
   test('renders typed destination fields for MQTT and webhook', async () => {
@@ -98,6 +149,65 @@ describe('Notifications page configuration', () => {
     await user.selectOptions(screen.getByLabelText('Type'), 'webhook');
     expect(screen.getByText('Query Parameters')).toBeInTheDocument();
     expect(screen.getByLabelText('Body Template')).toBeInTheDocument();
+  });
+
+  test('submits the email subject prefix from the destination form', async () => {
+    const user = userEvent.setup();
+    render(<Notifications />);
+
+    await user.click(await screen.findByRole('button', { name: /add destination/i }));
+    await user.selectOptions(screen.getByLabelText('Type'), 'email');
+    expect(screen.getByLabelText('Subject Prefix')).toHaveValue('[CrowdSec]');
+
+    await user.type(screen.getByLabelText('Name'), 'Security email');
+    await user.type(screen.getByLabelText('SMTP Host'), 'smtp.example.com');
+    await user.type(screen.getByLabelText('From Address'), 'alerts@example.com');
+    await user.type(screen.getByLabelText('To Address(es)'), 'admin@example.com');
+    await user.clear(screen.getByLabelText('Subject Prefix'));
+    await user.type(screen.getByLabelText('Subject Prefix'), 'Home');
+    await user.click(screen.getByRole('button', { name: /save destination/i }));
+
+    await waitFor(() => expect(createNotificationChannel).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'email',
+      config: expect.objectContaining({ subjectPrefix: 'Home' }),
+    })));
+  });
+
+  test('submits all ntfy settings and offers every Gotify priority', async () => {
+    const user = userEvent.setup();
+    render(<Notifications />);
+
+    await user.click(await screen.findByRole('button', { name: /add destination/i }));
+    expect(screen.getByLabelText('Username')).toBeInTheDocument();
+    expect(screen.getByLabelText('Password')).toBeInTheDocument();
+    expect(screen.getByLabelText('Title Prefix')).toHaveValue('CrowdSec');
+    expect(screen.getByLabelText('Tags')).toHaveValue('warning,shield');
+
+    await user.type(screen.getByLabelText('Name'), 'Private ntfy');
+    await user.type(screen.getByLabelText('Topic'), 'alerts');
+    await user.type(screen.getByLabelText('Username'), 'operator');
+    await user.type(screen.getByLabelText('Password'), 'secret');
+    await user.clear(screen.getByLabelText('Title Prefix'));
+    await user.type(screen.getByLabelText('Title Prefix'), 'Network A');
+    await user.clear(screen.getByLabelText('Tags'));
+    await user.type(screen.getByLabelText('Tags'), 'shield');
+    await user.click(screen.getByRole('button', { name: /save destination/i }));
+
+    await waitFor(() => expect(createNotificationChannel).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ntfy',
+      config: expect.objectContaining({
+        ntfyUsername: 'operator',
+        ntfyPassword: 'secret',
+        titlePrefix: 'Network A',
+        tags: 'shield',
+      }),
+    })));
+
+    await user.click(screen.getByRole('button', { name: /add destination/i }));
+    await user.selectOptions(screen.getByLabelText('Type'), 'gotify');
+    expect(within(screen.getByLabelText('Priority')).getAllByRole('option')).toHaveLength(12);
+    await user.selectOptions(screen.getByLabelText('Priority'), '9');
+    expect(screen.getByLabelText('Priority')).toHaveValue('9');
   });
 
   test('shows unchanged placeholder for stored secrets when editing', async () => {
@@ -276,6 +386,26 @@ describe('Notifications page configuration', () => {
     expect(screen.queryByLabelText('Target Contains')).not.toBeInTheDocument();
   });
 
+  test('shows and submits the CrowdSec update rule without alert filters', async () => {
+    const user = userEvent.setup();
+    render(<Notifications />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /add rule/i })).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: /add rule/i }));
+    await user.selectOptions(screen.getByLabelText('Rule Type'), 'crowdsec-update');
+
+    expect(screen.getByText(/latest stable CrowdSec release/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText('Scenario Contains')).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText('Name'), 'CrowdSec updates');
+    await user.click(screen.getByRole('button', { name: /save rule/i }));
+
+    await waitFor(() => expect(createNotificationRule).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'CrowdSec updates',
+      type: 'crowdsec-update',
+      config: {},
+    })));
+  });
+
   test('shows and submits the lapi availability rule config without alert filters', async () => {
     const user = userEvent.setup();
     render(<Notifications />);
@@ -345,6 +475,39 @@ describe('Notifications page configuration', () => {
     }));
   });
 
+  test('shows scenario exclusion and time-window help on applicable rule types', async () => {
+    const user = userEvent.setup();
+    render(<Notifications />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /add rule/i })).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: /add rule/i }));
+
+    const ruleType = screen.getByLabelText('Rule Type');
+    const windowCases = [
+      ['alert-spike', /compare alerts in this rolling window/i],
+      ['alert-threshold', /count matching alerts created within this rolling window/i],
+      ['new-alert-decision', /look back this many minutes for newly created alerts and decisions/i],
+      ['ip-ban', /look back this many minutes for ban decisions that are still active/i],
+    ] as const;
+    for (const [type, hint] of windowCases) {
+      await user.selectOptions(ruleType, type);
+      expect(screen.getByLabelText('Scenario Contains')).toBeInTheDocument();
+      expect(screen.getByRole('checkbox', { name: 'Exclude matching scenarios' })).toBeInTheDocument();
+      expect(screen.getByLabelText('Window Minutes')).toBeInTheDocument();
+      expect(screen.getByText(hint)).toBeInTheDocument();
+    }
+
+    await user.selectOptions(ruleType, 'new-cve');
+    expect(screen.getByRole('checkbox', { name: 'Exclude matching scenarios' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Window Minutes')).not.toBeInTheDocument();
+
+    for (const type of ['application-update', 'crowdsec-update', 'lapi-availability']) {
+      await user.selectOptions(ruleType, type);
+      expect(screen.queryByRole('checkbox', { name: 'Exclude matching scenarios' })).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('Window Minutes')).not.toBeInTheDocument();
+    }
+  });
+
   test('configures per-record alerts and decisions with filters', async () => {
     const user = userEvent.setup();
     render(<Notifications />);
@@ -358,8 +521,12 @@ describe('Notifications page configuration', () => {
     expect(screen.getByRole('checkbox', { name: 'Decisions' })).toBeChecked();
     expect(screen.getByLabelText('IP / Range Filter')).toBeInTheDocument();
     expect(screen.getByText(/include simulated alerts and decisions/i)).toBeInTheDocument();
+    expect(screen.getByText(/look back this many minutes/i)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Exclude matching scenarios' })).not.toBeChecked();
 
     await user.type(screen.getByLabelText('Name'), 'Every decision');
+    await user.type(screen.getByLabelText('Scenario Contains'), 'ssh');
+    await user.click(screen.getByRole('checkbox', { name: 'Exclude matching scenarios' }));
     await user.click(screen.getByRole('checkbox', { name: 'Alerts' }));
     await user.type(screen.getByLabelText('IP / Range Filter'), '10.0.0.0/24');
     await user.click(screen.getByRole('button', { name: /save rule/i }));
@@ -371,7 +538,8 @@ describe('Notifications page configuration', () => {
         window_minutes: 5,
         event_type: 'decision',
         filters: {
-          scenario: '',
+          scenario: 'ssh',
+          exclude_scenario: true,
           target: '',
           include_simulated: false,
           values: ['10.0.0.0/24'],

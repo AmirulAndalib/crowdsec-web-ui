@@ -4,6 +4,7 @@ import type {
   AlertMetaValue,
   AlertSpikeRuleConfig,
   ApplicationUpdateRuleConfig,
+  CrowdsecUpdateRuleConfig,
   AlertRecord,
   AlertThresholdRuleConfig,
   IpBanRuleConfig,
@@ -12,12 +13,14 @@ import type {
   NewAlertDecisionRuleConfig,
   NewCveRuleConfig,
   NotificationChannel,
+  NotificationChannelTestResult,
   NotificationChannelType,
   NotificationDeliveryResult,
   NotificationFilter,
   NotificationItem,
   NotificationListResponse,
   NotificationRule,
+  NotificationRuleTestResult,
   NotificationRuleConfig,
   NotificationRuleType,
   NotificationSeverity,
@@ -34,8 +37,9 @@ import {
 import type { NotificationOutboundGuard } from './notifications/outbound-guard';
 import type { NotificationSecretStore } from './notifications/secret-store';
 import type { UpdateChecker } from './update-check';
+import type { CrowdsecUpdateChecker, CrowdsecUpdateObservation } from './crowdsec-update-check';
 import { getServerTranslator, type Translator } from './i18n';
-import type { TimeFormat } from './config';
+import type { DateFormat, TimeFormat } from './config';
 import { formatDateTime } from './utils/date-time';
 import {
   ALERT_RECORD_COLUMNS,
@@ -58,6 +62,7 @@ export interface NotificationServiceOptions {
   fetchImpl?: FetchLike;
   mqttPublishImpl?: (config: MqttPublishConfig, payload: string) => Promise<void>;
   updateChecker?: UpdateChecker;
+  crowdsecUpdateChecker?: CrowdsecUpdateChecker;
   getLapiStatus?: () => LapiStatus;
   getLapiStatuses?: () => Array<{ instanceId: string; instanceName: string; status: LapiStatus }>;
   outboundGuard: NotificationOutboundGuard;
@@ -65,6 +70,7 @@ export interface NotificationServiceOptions {
   debugPayloads?: boolean;
   timeZone?: string | null;
   timeFormat?: TimeFormat;
+  dateFormat?: DateFormat;
   instanceAware?: boolean;
   instances?: ReadonlyArray<{ id: string; name: string }>;
 }
@@ -112,7 +118,8 @@ export interface NotificationService {
   markNotificationRead: (id: string) => Promise<boolean>;
   markNotificationsRead: (ids: string[]) => Promise<number>;
   markAllNotificationsRead: () => Promise<number>;
-  testChannel: (id: string) => Promise<void>;
+  testChannel: (id: string) => Promise<NotificationChannelTestResult>;
+  testRule: (id: string) => Promise<NotificationRuleTestResult>;
   evaluateRules: (now?: Date) => Promise<void>;
 }
 
@@ -126,6 +133,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
   const fetchImpl = options.fetchImpl || fetch;
   const mqttPublishImpl = options.mqttPublishImpl;
   const updateChecker = options.updateChecker;
+  const crowdsecUpdateChecker = options.crowdsecUpdateChecker;
   const getLapiStatus = options.getLapiStatus;
   const getLapiStatuses = options.getLapiStatuses;
   const outboundGuard = options.outboundGuard;
@@ -151,6 +159,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
     markNotificationsRead,
     markAllNotificationsRead,
     testChannel,
+    testRule,
     evaluateRules,
   };
 
@@ -279,7 +288,7 @@ export function createNotificationService(options: NotificationServiceOptions): 
     return writeDatabase(() => database.markAllNotificationsRead(new Date().toISOString()));
   }
 
-  async function testChannel(id: string): Promise<void> {
+  async function testChannel(id: string): Promise<NotificationChannelTestResult> {
     const channel = getStoredChannel(id);
     if (!channel) {
       throw new Error('Notification channel not found');
@@ -289,21 +298,112 @@ export function createNotificationService(options: NotificationServiceOptions): 
     }
     const t = getServerTranslator(database);
 
-    const result = await sendToChannel(channel, {
+    const candidate: NotificationCandidate = {
       title: t('server.notifications.test.title'),
       message: t('server.notifications.test.message', {
-        timestamp: formatDateTime(new Date(), options.timeZone ?? null, options.timeFormat ?? 'browser'),
+        timestamp: formatDateTime(new Date(), options.timeZone ?? null, options.timeFormat ?? 'browser', options.dateFormat ?? 'browser'),
       }),
       metadata: { kind: 'test' },
       dedupeKey: `test:${Date.now()}`,
-    }, 'info', {
+    };
+    const delivery = await sendToChannel(channel, candidate, 'info', {
       id: 'test',
       name: t('server.notifications.test.ruleName'),
       type: 'test',
     });
-    if (result.status !== 'delivered') {
-      throw new Error(result.error || 'Test notification failed');
+    if (delivery.status !== 'delivered') {
+      throw new Error(delivery.error || 'Test notification failed');
     }
+    return { success: true, title: candidate.title, message: candidate.message, delivery };
+  }
+
+  async function testRule(id: string): Promise<NotificationRuleTestResult> {
+    const rule = getStoredRule(id);
+    if (!rule) {
+      throw new Error('Notification rule not found');
+    }
+
+    const channels = loadChannels(false).filter((channel) => channel.enabled && rule.channel_ids.includes(channel.id));
+    if (channels.length === 0) {
+      throw new Error('This rule has no enabled outbound destinations');
+    }
+
+    const now = new Date();
+    const t = getServerTranslator(database);
+    const candidates = rule.type === 'crowdsec-update'
+      ? evaluateCrowdsecUpdateRule(rule, await crowdsecUpdateChecker?.() || [], t)
+      : await evaluateRule(rule, now, t);
+    const source: NotificationRuleTestResult['source'] = candidates.length > 0 ? 'current' : 'sample';
+    const candidate = candidates.at(-1) || createSampleRuleCandidate(rule, now, t);
+    const testCandidate: NotificationCandidate = {
+      ...candidate,
+      title: t('server.notifications.ruleTest.title', { title: candidate.title }),
+      metadata: { ...candidate.metadata, kind: 'test', test_source: source },
+      dedupeKey: `test:${crypto.randomUUID()}`,
+    };
+    const deliveries = await Promise.all(channels.map((channel) =>
+      sendToChannel(channel, testCandidate, candidate.severity || rule.severity, rule)));
+
+    return { source, title: testCandidate.title, message: testCandidate.message, deliveries };
+  }
+
+  function createSampleRuleCandidate(rule: NotificationRule, now: Date, t: Translator): NotificationCandidate {
+    const name = { ruleName: rule.name };
+    const timestamp = now.toISOString();
+    const sample = (title: string, message: string, metadata: Record<string, AlertMetaValue>): NotificationCandidate => ({
+      dedupeKey: 'sample', title, message, metadata,
+    });
+
+    if (rule.type === 'alert-spike') {
+      const config = normalizeRuleConfig('alert-spike', rule.config);
+      const count = Math.max(10, config.minimum_current_alerts, Math.ceil(config.percent_increase / 100) + 2);
+      const previousCount = 1;
+      const percent = (count - previousCount) * 100;
+      return sample(t('server.notifications.alertSpike.title', name),
+        t('server.notifications.alertSpike.message', { count, minutes: config.window_minutes, percent, previousCount }),
+        { current_count: count, previous_count: previousCount, increase_percent: percent, window_minutes: config.window_minutes });
+    }
+    if (rule.type === 'alert-threshold') {
+      const config = normalizeRuleConfig('alert-threshold', rule.config);
+      return sample(t('server.notifications.alertThreshold.title', name),
+        t('server.notifications.alertThreshold.message', { count: config.alert_threshold, minutes: config.window_minutes, threshold: config.alert_threshold }),
+        { matched_alerts: config.alert_threshold, threshold: config.alert_threshold, window_minutes: config.window_minutes });
+    }
+    if (rule.type === 'new-alert-decision') {
+      const config = normalizeRuleConfig('new-alert-decision', rule.config);
+      if (config.event_type === 'decision') {
+        return sample(t('server.notifications.newEvent.decisionTitle', name),
+          t('server.notifications.newEvent.decisionMessage', { id: '1', type: 'ban', value: '192.0.2.1', scenario: 'example/scenario', target: 'ssh', createdAt: timestamp, stopAt: timestamp }),
+          { event_type: 'decision', decision_id: '1', type: 'ban', value: '192.0.2.1', scenario: 'example/scenario', target: 'ssh', created_at: timestamp, stop_at: timestamp });
+      }
+      return sample(t('server.notifications.newEvent.alertTitle', name),
+        t('server.notifications.newEvent.alertMessage', { id: '1', scenario: 'example/scenario', source: '192.0.2.1', target: 'ssh', createdAt: timestamp, description: t('server.notifications.ruleTest.sampleAlert') }),
+        { event_type: 'alert', alert_id: '1', scenario: 'example/scenario', source: '192.0.2.1', target: 'ssh', created_at: timestamp, message: t('server.notifications.ruleTest.sampleAlert') });
+    }
+    if (rule.type === 'new-cve') {
+      return sample(t('server.notifications.newCve.title', name),
+        t('server.notifications.newCve.message', { cveId: `CVE-${now.getUTCFullYear()}-0001`, ageDays: 1, count: 1 }),
+        { cve_id: `CVE-${now.getUTCFullYear()}-0001`, age_days: 1, matched_alerts: 1 });
+    }
+    if (rule.type === 'ip-ban') {
+      return sample(t('server.notifications.ipBan.title', name),
+        t('server.notifications.ipBan.message', { value: '192.0.2.1', scenarioDetail: '', stopAtDetail: '' }),
+        { decision_id: '1', value: '192.0.2.1', type: 'ban', scenario: null, stop_at: null });
+    }
+    if (rule.type === 'application-update') {
+      return sample(t('server.notifications.applicationUpdate.title', name),
+        t('server.notifications.applicationUpdate.message', { currentVersion: 'v1.0.0', targetVersion: 'v1.1.0' }),
+        { update_available: true, local_version: 'v1.0.0', remote_version: 'v1.1.0' });
+    }
+    if (rule.type === 'crowdsec-update') {
+      return sample(t('server.notifications.crowdsecUpdate.title', name),
+        t('server.notifications.crowdsecUpdate.message', { instanceName: 'CrowdSec', endpointName: 'LAPI', currentVersion: 'v1.0.0', targetVersion: 'v1.1.0' }),
+        { instance_name: 'CrowdSec', endpoint_name: 'LAPI', local_version: 'v1.0.0', remote_version: 'v1.1.0' });
+    }
+    const config = normalizeRuleConfig('lapi-availability', rule.config);
+    return sample(t('server.notifications.lapiUnavailable.title', name),
+      t('server.notifications.lapiUnavailable.message', { seconds: config.outage_threshold_seconds }),
+      { outage_threshold_seconds: config.outage_threshold_seconds, outage_duration_seconds: config.outage_threshold_seconds });
   }
 
   async function evaluateRules(now = new Date()): Promise<void> {
@@ -316,15 +416,24 @@ export function createNotificationService(options: NotificationServiceOptions): 
     const timestamp = now.toISOString();
     const t = getServerTranslator(database);
     for (const rule of rules) {
-      const candidates = dedupeCandidates(await evaluateRule(rule, now, t));
+      if (rule.type === 'crowdsec-update' && !crowdsecUpdateChecker) continue;
+      const crowdsecObservations = rule.type === 'crowdsec-update'
+        ? await crowdsecUpdateChecker?.() || []
+        : null;
+      const candidates = dedupeCandidates(crowdsecObservations
+        ? evaluateCrowdsecUpdateRule(rule, crowdsecObservations, t)
+        : await evaluateRule(rule, now, t));
       const activeIncidents = loadActiveIncidents(rule.id);
       const candidateKeys = new Set(candidates.map((candidate) => candidate.dedupeKey));
+      const unknownPrefixes = crowdsecObservations?.filter((observation) => observation.updateAvailable === null)
+        .map((observation) => crowdsecUpdateIncidentPrefix(observation)) || [];
 
       for (const incident of activeIncidents.values()) {
-        if (!candidateKeys.has(incident.incidentKey)) {
+        if (!candidateKeys.has(incident.incidentKey)
+          && !unknownPrefixes.some((prefix) => incident.incidentKey.startsWith(prefix))) {
           await writeDatabase(() => {
             database.resolveNotificationIncident(rule.id, incident.incidentKey, timestamp);
-            if (rule.type === 'application-update') {
+            if (rule.type === 'application-update' || rule.type === 'crowdsec-update') {
               database.deleteNotificationByRuleAndDedupeKey(rule.id, incident.incidentKey);
             }
           });
@@ -601,6 +710,38 @@ export function createNotificationService(options: NotificationServiceOptions): 
       return evaluateIpBanRule(rule, now, t);
     }
     return evaluateNewCveRule(rule, now, t);
+  }
+
+  function evaluateCrowdsecUpdateRule(rule: NotificationRule, observations: CrowdsecUpdateObservation[], t: Translator): NotificationCandidate[] {
+    return observations.flatMap((observation) => {
+      if (!observation.updateAvailable || !observation.currentVersion || !observation.remoteVersion) return [];
+      return [{
+        dedupeKey: `${crowdsecUpdateIncidentPrefix(observation)}${observation.remoteVersion}`,
+        title: t('server.notifications.crowdsecUpdate.title', { ruleName: rule.name }),
+        message: [
+          t('server.notifications.crowdsecUpdate.message', {
+            instanceName: observation.instanceName,
+            endpointName: observation.endpointName,
+            currentVersion: observation.currentVersion,
+            targetVersion: observation.remoteVersion,
+          }),
+          observation.releaseUrl,
+        ].filter(Boolean).join(' '),
+        metadata: {
+          instance_id: observation.instanceId,
+          instance_name: observation.instanceName,
+          endpoint_id: observation.endpointId,
+          endpoint_name: observation.endpointName,
+          local_version: observation.currentVersion,
+          remote_version: observation.remoteVersion,
+          release_url: observation.releaseUrl,
+        },
+      }];
+    });
+  }
+
+  function crowdsecUpdateIncidentPrefix(observation: CrowdsecUpdateObservation): string {
+    return `crowdsec-update:${encodeURIComponent(observation.instanceId)}:${encodeURIComponent(observation.endpointId)}:`;
   }
 
   async function evaluateAlertSpikeRule(rule: NotificationRule, now: Date, t: Translator): Promise<NotificationCandidate[]> {
@@ -1042,7 +1183,9 @@ export function createNotificationService(options: NotificationServiceOptions): 
     const params: unknown[] = [start.toISOString(), end.toISOString()];
     if (filters?.include_simulated !== true) clauses.push('simulated = 0');
     if (filters?.scenario) {
-      clauses.push("LOWER(scenario) LIKE ? ESCAPE '\\'");
+      clauses.push(filters.exclude_scenario === true
+        ? "(scenario IS NULL OR LOWER(scenario) NOT LIKE ? ESCAPE '\\')"
+        : "LOWER(scenario) LIKE ? ESCAPE '\\'");
       params.push(`%${escapeSqlLike(filters.scenario.toLowerCase())}%`);
     }
     if (filters?.target) {
@@ -1187,6 +1330,7 @@ function normalizeRuleConfig(type: 'new-alert-decision', config: RuleConfigInput
 function normalizeRuleConfig(type: 'new-cve', config: RuleConfigInput): NewCveRuleConfig;
 function normalizeRuleConfig(type: 'ip-ban', config: RuleConfigInput): IpBanRuleConfig;
 function normalizeRuleConfig(type: 'application-update', config: RuleConfigInput): ApplicationUpdateRuleConfig;
+function normalizeRuleConfig(type: 'crowdsec-update', config: RuleConfigInput): CrowdsecUpdateRuleConfig;
 function normalizeRuleConfig(type: 'lapi-availability', config: RuleConfigInput): LapiAvailabilityRuleConfig;
 function normalizeRuleConfig(type: NotificationRuleType, config: RuleConfigInput): NotificationRuleConfig;
 function normalizeRuleConfig(type: NotificationRuleType, config: RuleConfigInput): NotificationRuleConfig {
@@ -1220,7 +1364,7 @@ function normalizeRuleConfig(type: NotificationRuleType, config: RuleConfigInput
     };
   }
 
-  if (type === 'application-update') {
+  if (type === 'application-update' || type === 'crowdsec-update') {
     return {};
   }
 
@@ -1262,6 +1406,7 @@ function normalizeFilters(filters: NotificationFilter | undefined): Notification
   }
   return {
     scenario: scenario || undefined,
+    exclude_scenario: scenario && filters.exclude_scenario === true ? true : undefined,
     target: target || undefined,
     include_simulated: filters.include_simulated === true,
     values: values.length > 0 ? values : undefined,
@@ -1270,11 +1415,15 @@ function normalizeFilters(filters: NotificationFilter | undefined): Notification
   };
 }
 
+function matchesScenarioFilter(scenario: string, filter: string, exclude: boolean): boolean {
+  return scenario.toLowerCase().includes(filter.toLowerCase()) !== exclude;
+}
+
 function matchesAlertFilters(alert: AlertRecord, filters?: NotificationFilter): boolean {
   if (filters?.include_simulated !== true && alert.simulated === true) {
     return false;
   }
-  if (filters?.scenario && !String(alert.scenario || '').toLowerCase().includes(filters.scenario.toLowerCase())) {
+  if (filters?.scenario && !matchesScenarioFilter(String(alert.scenario || ''), filters.scenario, filters.exclude_scenario === true)) {
     return false;
   }
   if (filters?.target && !String(alert.target || '').toLowerCase().includes(filters.target.toLowerCase())) {
@@ -1297,7 +1446,7 @@ function matchesDecisionFilters(decision: AlertDecision & Record<string, unknown
   if (filters?.include_simulated !== true && decision.simulated === true) {
     return false;
   }
-  if (filters?.scenario && !String(decision.scenario || '').toLowerCase().includes(filters.scenario.toLowerCase())) {
+  if (filters?.scenario && !matchesScenarioFilter(String(decision.scenario || ''), filters.scenario, filters.exclude_scenario === true)) {
     return false;
   }
   if (filters?.target && !String(decision.target || '').toLowerCase().includes(filters.target.toLowerCase())) {
@@ -1368,6 +1517,7 @@ function normalizeRuleType(value: unknown): NotificationRuleType {
     value === 'new-cve' ||
     value === 'ip-ban' ||
     value === 'application-update' ||
+    value === 'crowdsec-update' ||
     value === 'lapi-availability'
   ) return value;
   throw new Error('Invalid notification rule type');

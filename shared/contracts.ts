@@ -419,12 +419,13 @@ export interface UpdateCheckResponse {
 }
 
 export type NotificationChannelType = 'ntfy' | 'gotify' | 'email' | 'mqtt' | 'webhook';
-export type NotificationRuleType = 'alert-spike' | 'alert-threshold' | 'new-alert-decision' | 'new-cve' | 'ip-ban' | 'application-update' | 'lapi-availability';
+export type NotificationRuleType = 'alert-spike' | 'alert-threshold' | 'new-alert-decision' | 'new-cve' | 'ip-ban' | 'application-update' | 'crowdsec-update' | 'lapi-availability';
 export type NotificationSeverity = 'info' | 'warning' | 'critical';
 export type NotificationDeliveryStatus = 'delivered' | 'failed' | 'skipped';
 
 export interface NotificationFilter {
   scenario?: string;
+  exclude_scenario?: boolean;
   target?: string;
   include_simulated?: boolean;
   values?: string[];
@@ -465,6 +466,8 @@ export interface IpBanRuleConfig {
 
 export interface ApplicationUpdateRuleConfig {}
 
+export interface CrowdsecUpdateRuleConfig {}
+
 export interface LapiAvailabilityRuleConfig {
   outage_threshold_seconds: number;
   notify_on_recovery: boolean;
@@ -477,6 +480,7 @@ export type NotificationRuleConfig =
   | NewCveRuleConfig
   | IpBanRuleConfig
   | ApplicationUpdateRuleConfig
+  | CrowdsecUpdateRuleConfig
   | LapiAvailabilityRuleConfig;
 
 export interface NotificationChannel {
@@ -509,6 +513,20 @@ export interface NotificationDeliveryResult {
   status: NotificationDeliveryStatus;
   attempted_at: string;
   error?: string;
+}
+
+export interface NotificationChannelTestResult {
+  success: true;
+  title: string;
+  message: string;
+  delivery: NotificationDeliveryResult;
+}
+
+export interface NotificationRuleTestResult {
+  source: 'current' | 'sample';
+  title: string;
+  message: string;
+  deliveries: NotificationDeliveryResult[];
 }
 
 export interface NotificationItem {
@@ -568,6 +586,7 @@ export interface ConfigResponse {
   origin_features_enabled: boolean;
   time_zone?: string | null;
   time_format?: 'browser' | '12h' | '24h';
+  date_format?: string;
   metrics_enabled?: boolean;
   metrics_sidebar_visible?: boolean;
   deployment_mode?: 'load-test';
